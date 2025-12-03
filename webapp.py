@@ -3,19 +3,18 @@
 # FastAPI dashboard that uses:
 # - betfair_client.BetfairClient for race & price data (dummy or live)
 # - strategy.ProgressionStrategy for staking / progression + bank/P&L
-# Includes:
+# Now with:
 # - Simple login page (username/password)
 # - Session cookie to protect all routes
 # - Logout button
 # - Reset bank + % profiles (2, 5, 10, 15, 20)
 # - Live/dummy indicator for Betfair
 # - Betfair "available to bet" balance display
-# - Timing logic: place bets ~1 minute before off using placeOrders
+# - Mobile-friendly layout (no horizontal scrolling)
 
 import threading
 import time
 from typing import List
-from datetime import datetime, timezone
 
 from fastapi import FastAPI, Request, Form
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -42,7 +41,7 @@ SECRET_KEY = "super-secret-local-key-change-me-later"
 # ======================
 
 # Set use_dummy=False to use real Betfair data (Delayed app key is fine)
-# Make sure BETFAIR_APP_KEY / BETFAIR_USERNAME / BETFAIR_PASSWORD are set in your shell.
+# Make sure BETFAIR_APP_KEY / BETFAIR_USERNAME / BETFAIR_PASSWORD are set in your environment.
 client = BetfairClient(use_dummy=False)
 state = StrategyState()
 strategy = ProgressionStrategy(state)
@@ -51,9 +50,7 @@ strategy = ProgressionStrategy(state)
 class BotRunner:
     """
     Simple wrapper that runs the strategy in a background loop.
-
-    Now actually calls Betfair placeOrders (with a stake safety cap)
-    about 1 minute before the scheduled off time.
+    No real bets yet: just logs what it *would* do.
     """
 
     def __init__(self, strategy: ProgressionStrategy, client: BetfairClient):
@@ -61,20 +58,11 @@ class BotRunner:
         self.client = client
         self.running = False
 
-        # Timing / per-market state
-        self.current_market_start = None  # datetime (UTC) for current market
-        self.last_market_id = None        # to detect when the market changes
-        self.bet_placed_for_current = False  # "we've already acted at T-60s"
-
     def start_day(self):
         print("[BOT] Start day requested")
         # Use client's market lookup to name markets
         self.strategy.start_day(self.client.get_market_name)
         self.running = True
-        # Reset timing state
-        self.current_market_start = None
-        self.last_market_id = None
-        self.bet_placed_for_current = False
 
     def stop(self):
         print("[BOT] Stop requested")
@@ -82,121 +70,54 @@ class BotRunner:
 
     def on_race_won_manual(self):
         """
-        Manual hook for now. Later, you can replace this with automatic P&L detection.
+        Manual hook for now. Later, you replace this with automatic P&L detection.
         """
         if not state.current_market_id:
             print("[BOT] Race WON pressed but no current market.")
             return
-
-        # For now we assume a win returns roughly last_total_stake as profit.
+        # In dummy/testing mode, just treat last_total_stake as "profit"
         pnl = max(state.last_total_stake, 0.0)
         self.strategy.on_market_won(pnl=pnl)
         self.running = False
-
-        # Reset per-market flags in case you start again later
-        self.current_market_start = None
-        self.last_market_id = None
-        self.bet_placed_for_current = False
 
     def on_race_lost_manual(self):
         if not state.current_market_id:
             print("[BOT] Race LOST pressed but no current market.")
             return
 
-        # Treat last_total_stake as a full loss
+        # In dummy/testing mode, treat last_total_stake as a full loss
         pnl = -abs(state.last_total_stake)
         self.strategy.on_market_lost(pnl=pnl)
 
         # Move to next market in sequence if there is one and day isn't done
         if self.strategy.has_more_markets() and not state.day_done:
             self.strategy.update_current_market(self.client.get_market_name)
-            # New market: reset timing state
-            self.current_market_start = None
-            self.last_market_id = None
-            self.bet_placed_for_current = False
         else:
             print("[BOT] No more markets or day done.")
             self.running = False
 
     def loop(self):
-        print("[BOT] Loop started (will call placeOrders when live).")
+        print("[BOT] Loop started (dummy; no real bets).")
         while True:
-            try:
-                if self.running and not state.day_done and state.current_market_id:
-                    mid = state.current_market_id
-
-                    # Detect market change
-                    if mid != self.last_market_id:
-                        print(f"[BOT] Switched to new market: {mid}")
-                        self.current_market_start = self.client.get_market_start_time(mid)
-                        self.last_market_id = mid
-                        self.bet_placed_for_current = False
-
-                        if self.current_market_start:
-                            print(
-                                "[BOT] Scheduled start (UTC):",
-                                self.current_market_start.isoformat(),
-                            )
-                        else:
-                            print("[BOT] Could not fetch start time for market.")
-
-                    # If we know the start time, check time-to-off
-                    if self.current_market_start:
-                        now = datetime.now(timezone.utc)
-                        secs_to_off = (self.current_market_start - now).total_seconds()
-
-                        # Only act between 0 and 60 seconds before the official off
-                        if 0 < secs_to_off <= 60 and not self.bet_placed_for_current:
-                            favs = self.client.get_top_two_favourites(mid)
-                            if len(favs) == 2:
-                                o1 = favs[0]["back"]
-                                o2 = favs[1]["back"]
-                                s1, s2, total, profit = self.strategy.compute_dutch_for_current(o1, o2)
-
-                                if total > 0:
-                                    if self.client.use_dummy:
-                                        # Safety: if use_dummy=True, only log
-                                        print(
-                                            f"[BOT] ~60s to off. (DUMMY) Would place bets now on "
-                                            f"{state.current_market_name} | "
-                                            f"stakes: s1={s1:.2f}, s2={s2:.2f}, total={total:.2f} | "
-                                            f"expected profit if either wins: {profit:.2f}"
-                                        )
-                                    else:
-                                        # REAL call to Betfair placeOrders
-                                        print(
-                                            f"[BOT] ~60s to off. Placing dutched bets on "
-                                            f"{state.current_market_name} | "
-                                            f"stakes before safety: s1={s1:.2f}, s2={s2:.2f}, total={total:.2f}"
-                                        )
-                                        try:
-                                            result = self.client.place_dutch_bets(
-                                                market_id=mid,
-                                                favs=favs,
-                                                stake1=s1,
-                                                stake2=s2,
-                                            )
-                                            print("[BOT] place_dutch_bets API result:", result)
-                                        except Exception as e:
-                                            print("[BOT] ERROR during place_dutch_bets:", e)
-                                        # Either way, mark that we've attempted to place bets
-                                    self.bet_placed_for_current = True
-                                else:
-                                    print(
-                                        "[BOT] Dutch calculation returned zero stake. "
-                                        "Skipping this race."
-                                    )
-                            else:
-                                print(
-                                    "[BOT] Could not get 2 favourites at T-60s, "
-                                    "no bets placed."
-                                )
-                # Sleep interval: balance between responsiveness and API usage
-                time.sleep(5)
-            except Exception as e:
-                print("[BOT LOOP ERROR]", e)
-                # Don't crash the loop forever; short pause
-                time.sleep(5)
+            if self.running and not state.day_done and state.current_market_id:
+                # Get top 2 favourites for current market
+                favs = self.client.get_top_two_favourites(state.current_market_id)
+                if len(favs) == 2:
+                    o1 = favs[0]["back"]
+                    o2 = favs[1]["back"]
+                    s1, s2, total, profit = self.strategy.compute_dutch_for_current(o1, o2)
+                    print(
+                        f"[BOT] Market: {state.current_market_name} | "
+                        f"Back odds: {o1}, {o2} | "
+                        f"Total stake: {total:.2f} (s1={s1:.2f}, s2={s2:.2f}) | "
+                        f"Profit if either wins: {profit:.2f} | "
+                        f"Losses so far: {state.losses_so_far:.2f} | "
+                        f"Bank: {state.current_bank:.2f} | "
+                        f"Today P/L: {state.todays_pl:.2f}"
+                    )
+                else:
+                    print("[BOT] Cannot find 2 favourites for current market.")
+            time.sleep(10)
 
 
 bot = BotRunner(strategy, client)
@@ -227,6 +148,7 @@ def render_login(message: str = "") -> HTMLResponse:
     <html>
       <head>
         <title>Betfair Bot – Login</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
         <style>
           :root {{
             --bg: #020617;
@@ -252,6 +174,7 @@ def render_login(message: str = "") -> HTMLResponse:
             display: flex;
             align-items: center;
             justify-content: center;
+            overflow-x: hidden;
           }}
 
           .shell {{
@@ -305,6 +228,7 @@ def render_login(message: str = "") -> HTMLResponse:
             color: var(--text-main);
             padding: 7px 11px;
             font-size: 13px;
+            width: 100%;
           }}
 
           .field-label input:focus {{
@@ -337,6 +261,7 @@ def render_login(message: str = "") -> HTMLResponse:
 
           .btn-primary:hover {{
             background: var(--accent-strong);
+            transform: translateY(-1px);
             box-shadow: 0 10px 20px rgba(34, 197, 94, 0.35);
           }}
 
@@ -539,6 +464,7 @@ def render_dashboard(message: str = ""):
     <html>
       <head>
         <title>Betfair Favourites Bot – Web UI</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
         <style>
           :root {{
             --bg: #020617;
@@ -568,12 +494,19 @@ def render_dashboard(message: str = ""):
             display: flex;
             align-items: flex-start;
             justify-content: center;
+            overflow-x: hidden;
           }}
 
           .shell {{
             width: 100%;
-            max-width: 1100px;
-            padding: 32px 16px 48px;
+            max-width: 1040px;
+            padding: 24px 12px 40px;
+          }}
+
+          @media (max-width: 768px) {{
+            .shell {{
+              padding: 16px 10px 28px;
+            }}
           }}
 
           .card {{
@@ -583,18 +516,24 @@ def render_dashboard(message: str = ""):
             box-shadow:
               0 24px 60px rgba(15, 23, 42, 0.7),
               0 0 0 1px rgba(15, 23, 42, 0.9);
-            padding: 24px 24px 28px;
+            padding: 20px 16px 24px;
+          }}
+
+          @media (min-width: 900px) {{
+            .card {{
+              padding: 24px 24px 28px;
+            }}
           }}
 
           h1 {{
             margin: 0 0 4px;
-            font-size: 24px;
+            font-size: 22px;
             letter-spacing: 0.03em;
             text-transform: uppercase;
           }}
 
           .subtitle {{
-            margin: 0 0 20px;
+            margin: 0 0 16px;
             font-size: 13px;
             color: var(--text-muted);
           }}
@@ -602,16 +541,17 @@ def render_dashboard(message: str = ""):
           .top-row {{
             display: flex;
             flex-wrap: wrap;
-            gap: 16px;
-            align-items: center;
+            gap: 12px;
+            align-items: flex-start;
             justify-content: space-between;
-            margin-bottom: 16px;
+            margin-bottom: 14px;
           }}
 
           .status-block {{
             display: flex;
             flex-direction: column;
             gap: 6px;
+            min-width: 0;
           }}
 
           .badges {{
@@ -631,6 +571,7 @@ def render_dashboard(message: str = ""):
             letter-spacing: 0.05em;
             text-transform: uppercase;
             border: 1px solid transparent;
+            white-space: nowrap;
           }}
 
           .chip-status {{
@@ -654,19 +595,24 @@ def render_dashboard(message: str = ""):
           .current-info {{
             font-size: 13px;
             color: var(--text-muted);
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            max-width: 100%;
           }}
 
           .controls {{
             display: flex;
             flex-wrap: wrap;
-            gap: 8px;
+            gap: 6px;
+            justify-content: flex-end;
           }}
 
           .btn {{
             border: 0;
             border-radius: 999px;
-            padding: 8px 14px;
-            font-size: 13px;
+            padding: 7px 11px;
+            font-size: 12px;
             cursor: pointer;
             font-weight: 500;
             letter-spacing: 0.03em;
@@ -675,6 +621,7 @@ def render_dashboard(message: str = ""):
             align-items: center;
             gap: 6px;
             transition: all 0.16s ease-out;
+            white-space: nowrap;
           }}
 
           .btn-primary {{
@@ -685,6 +632,7 @@ def render_dashboard(message: str = ""):
           .btn-primary:hover {{
             background: var(--accent-strong);
             transform: translateY(-1px);
+            box-shadow: 0 10px 20px rgba(34, 197, 94, 0.35);
           }}
 
           .btn-ghost {{
@@ -711,9 +659,9 @@ def render_dashboard(message: str = ""):
 
           .grid {{
             display: grid;
-            grid-template-columns: minmax(0, 1.15fr) minmax(0, 1.1fr);
-            gap: 20px;
-            margin-top: 22px;
+            grid-template-columns: minmax(0, 1.10fr) minmax(0, 1.05fr);
+            gap: 16px;
+            margin-top: 18px;
           }}
 
           @media (max-width: 900px) {{
@@ -726,7 +674,13 @@ def render_dashboard(message: str = ""):
             background: rgba(15, 23, 42, 0.7);
             border-radius: 16px;
             border: 1px solid var(--border-subtle);
-            padding: 16px 18px 18px;
+            padding: 14px 12px 16px;
+          }}
+
+          @media (min-width: 900px) {{
+            .panel {{
+              padding: 16px 18px 18px;
+            }}
           }}
 
           .panel h2 {{
@@ -749,7 +703,7 @@ def render_dashboard(message: str = ""):
           .race-list {{
             display: flex;
             flex-direction: column;
-            gap: 10px;
+            gap: 8px;
             max-height: 260px;
             overflow-y: auto;
             padding-right: 4px;
@@ -767,8 +721,8 @@ def render_dashboard(message: str = ""):
           .race-card {{
             display: flex;
             flex-direction: column;
-            gap: 4px;
-            padding: 10px 11px;
+            gap: 3px;
+            padding: 8px 9px;
             border-radius: 10px;
             border: 1px solid var(--border-subtle);
             background: rgba(15, 23, 42, 0.9);
@@ -797,7 +751,7 @@ def render_dashboard(message: str = ""):
           }}
 
           .race-actions {{
-            margin-top: 10px;
+            margin-top: 8px;
             text-align: right;
           }}
 
@@ -820,7 +774,7 @@ def render_dashboard(message: str = ""):
 
           .ladder-table th,
           .ladder-table td {{
-            padding: 8px 10px;
+            padding: 6px 8px;
             text-align: left;
           }}
 
@@ -854,22 +808,22 @@ def render_dashboard(message: str = ""):
           }}
 
           .ladder-note {{
-            margin-top: 10px;
+            margin-top: 8px;
             font-size: 12px;
             color: var(--text-muted);
           }}
 
           .settings-form {{
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
-            gap: 10px 14px;
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            gap: 8px 10px;
             margin-top: 8px;
           }}
 
           .field-label {{
             display: flex;
             flex-direction: column;
-            gap: 4px;
+            gap: 3px;
             font-size: 12px;
             color: var(--text-muted);
           }}
@@ -885,8 +839,9 @@ def render_dashboard(message: str = ""):
             border: 1px solid var(--border-subtle);
             background: rgba(15, 23, 42, 0.9);
             color: var(--text-main);
-            padding: 6px 10px;
+            padding: 6px 9px;
             font-size: 13px;
+            width: 100%;
           }}
 
           .field-label input:focus {{
@@ -896,10 +851,10 @@ def render_dashboard(message: str = ""):
           }}
 
           .settings-footer {{
-            margin-top: 12px;
+            margin-top: 10px;
             display: flex;
             flex-direction: column;
-            gap: 10px;
+            gap: 8px;
           }}
 
           .profile-row {{
@@ -924,8 +879,8 @@ def render_dashboard(message: str = ""):
           }}
 
           .profile-buttons .btn {{
-            padding: 4px 10px;
-            font-size: 12px;
+            padding: 4px 9px;
+            font-size: 11px;
           }}
 
           .muted {{
@@ -951,17 +906,23 @@ def render_dashboard(message: str = ""):
           .bank-card {{
             display: grid;
             grid-template-columns: repeat(4, minmax(0, 1fr));
-            gap: 12px;
+            gap: 10px;
             border-radius: 14px;
             border: 1px solid var(--border-subtle);
             background: rgba(15, 23, 42, 0.9);
-            padding: 10px 14px;
+            padding: 9px 10px;
+          }}
+
+          @media (max-width: 700px) {{
+            .bank-card {{
+              grid-template-columns: repeat(2, minmax(0, 1fr));
+            }}
           }}
 
           .bank-metric {{
             display: flex;
             flex-direction: column;
-            gap: 3px;
+            gap: 2px;
           }}
 
           .bank-label {{
@@ -976,19 +937,13 @@ def render_dashboard(message: str = ""):
             font-variant-numeric: tabular-nums;
           }}
 
-          @media (max-width: 700px) {{
-            .bank-card {{
-              grid-template-columns: repeat(2, minmax(0, 1fr));
-            }}
-          }}
-
           .bank-actions {{
             margin-top: 6px;
             text-align: right;
           }}
 
           .footer-note {{
-            margin-top: 20px;
+            margin-top: 18px;
             font-size: 11px;
             color: var(--text-muted);
           }}
@@ -998,7 +953,7 @@ def render_dashboard(message: str = ""):
         <div class="shell">
           <div class="card">
             <h1>Betfair Favourites Bot</h1>
-            <p class="subtitle">Novice hurdles · 2-favourite dutching · Timed entries</p>
+            <p class="subtitle">Novice hurdles · 2-favourite dutching · Test / dummy mode</p>
 
             <div class="top-row">
               <div class="status-block">
@@ -1140,8 +1095,8 @@ def render_dashboard(message: str = ""):
             </div>
 
             <p class="footer-note">
-              Bot will attempt to place two dutched BACK bets about 60s before the off,<br/>
-              with a hard stake safety cap controlled by BETFAIR_MAX_TOTAL_STAKE.
+              All data is dummy for staking logic only – no real bets are placed by this code.<br/>
+              When you plug in the real Betfair API &amp; placeOrders, this UI will control the live bot.
             </p>
           </div>
         </div>
@@ -1205,11 +1160,6 @@ async def update_race_selection(
     state.selected_market_ids = market_ids
     state.current_index = 0
     strategy.update_current_market(client.get_market_name)
-    # Reset bot timing state because the race list changed
-    bot.current_market_start = None
-    bot.last_market_id = None
-    bot.bet_placed_for_current = False
-
     return render_dashboard("Race list updated.")
 
 
@@ -1258,12 +1208,6 @@ async def reset_bank(request: Request):
     state.losses_so_far = 0.0
     state.day_done = False
     bot.stop()
-
-    # Reset timing state
-    bot.current_market_start = None
-    bot.last_market_id = None
-    bot.bet_placed_for_current = False
-
     return render_dashboard("Bank reset to starting value for this session.")
 
 
@@ -1299,7 +1243,4 @@ async def apply_profile(
         msg = "Error applying profile. Please try again."
 
     return render_dashboard(msg)
-
-
-
 
