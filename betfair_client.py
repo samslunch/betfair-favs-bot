@@ -3,15 +3,14 @@
 # BetfairClient with dummy mode + real API-NG integration for:
 # - get_todays_novice_hurdle_markets()
 # - get_market_name()
-# - get_market_start_time()
 # - get_top_two_favourites()
 # - get_account_funds()
-# - place_dutch_bets()  <-- NEW (real placeOrders with safety cap)
 
 import os
 import datetime as dt
-import requests
 from typing import List, Dict, Any, Optional
+
+import requests
 
 
 BETTING_ENDPOINT = "https://api.betfair.com/exchange/betting/json-rpc/v1"
@@ -26,12 +25,6 @@ class BetfairClient:
         self.username = os.getenv("BETFAIR_USERNAME", "")
         self.password = os.getenv("BETFAIR_PASSWORD", "")
         self.session_token: Optional[str] = None
-
-        # Safety cap for real betting – default £2 total per race
-        try:
-            self.max_total_stake = float(os.getenv("BETFAIR_MAX_TOTAL_STAKE", "2.0"))
-        except ValueError:
-            self.max_total_stake = 2.0
 
         print(f"[BETFAIR] Initialising client. use_dummy={self.use_dummy}")
 
@@ -154,7 +147,13 @@ class BetfairClient:
     def get_todays_novice_hurdle_markets(self) -> List[Dict[str, Any]]:
         """
         Returns a list of dicts: { 'market_id': str, 'name': str }
-        For now: UK & IRE horse racing, marketType = 'WIN', with 'Novice' + 'Hurdle/Hrd' in name.
+
+        Looser matching:
+        - Horse Racing (eventType 7)
+        - GB / IE
+        - WIN markets
+        - marketName includes something hurdle-ish (hurdle / hurd / hdle)
+        - and something novice-ish (nov / novice)
         """
         if self.use_dummy:
             print("[BETFAIR] Returning DUMMY novice hurdle markets.")
@@ -164,7 +163,7 @@ class BetfairClient:
                 {"market_id": "1.234567893", "name": "Dummy Novice Hurdle 15:15"},
             ]
 
-        print("[BETFAIR] Fetching REAL novice hurdle markets for today from API.")
+        print("[BETFAIR] Fetching REAL 'novice-style' hurdle WIN markets for today from API.")
 
         # Build a "today" time range in UTC
         now_utc = dt.datetime.utcnow()
@@ -182,24 +181,38 @@ class BetfairClient:
                 },
             },
             "maxResults": 200,
-            "marketProjection": ["MARKET_START_TIME", "EVENT", "RUNNER_DESCRIPTION"],
+            "marketProjection": ["MARKET_START_TIME", "EVENT"],
         }
 
         result = self._rpc("listMarketCatalogue", params)
-        markets = []
+        markets: List[Dict[str, Any]] = []
 
         for m in result:
-            name = m.get("marketName", "")
-            # Crude filter for novice hurdles – you can refine this later
-            if "Novice" in name and ("Hurdle" in name or "Hrd" in name):
+            raw_name = m.get("marketName", "") or ""
+            name = raw_name.strip()
+            ln = name.lower()
+
+            is_hurdle = any(x in ln for x in ["hurdle", "hurd", "hdle"])
+            is_noviceish = any(x in ln for x in ["nov", "novice"])
+
+            # Debug logs to see borderline names
+            if is_hurdle and not is_noviceish:
+                print(f"[BETFAIR][DEBUG] Hurdle but not novice-ish: {name}")
+            if is_noviceish and not is_hurdle:
+                print(f"[BETFAIR][DEBUG] Novice-ish but not hurdle: {name}")
+
+            if is_hurdle and is_noviceish:
+                venue = (m.get("event") or {}).get("venue", "").strip()
+                open_date = (m.get("event") or {}).get("openDate", "")
+                nice_name = f"{venue} {name} ({open_date})".strip()
                 markets.append(
                     {
                         "market_id": m["marketId"],
-                        "name": f"{m['event']['venue']} {name} ({m['event']['openDate']})",
+                        "name": nice_name,
                     }
                 )
 
-        print(f"[BETFAIR] Found {len(markets)} novice hurdle WIN markets today.")
+        print(f"[BETFAIR] Found {len(markets)} novice-style hurdle WIN markets today.")
         return markets
 
     def get_market_name(self, market_id: str) -> str:
@@ -218,42 +231,12 @@ class BetfairClient:
         if not result:
             return market_id
         m = result[0]
-        return f"{m['event']['venue']} {m['marketName']}"
-
-    def get_market_start_time(self, market_id: str) -> Optional[dt.datetime]:
-        """
-        Returns the scheduled start time for the market as a timezone-aware UTC datetime.
-        """
-        if self.use_dummy:
-            # For dummy mode, pretend the race is 5 minutes from now.
-            print(f"[BETFAIR] Returning DUMMY start time for market {market_id}.")
-            return dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=5)
-
-        print(f"[BETFAIR] Fetching start time for market {market_id}.")
-        params = {
-            "filter": {"marketIds": [market_id]},
-            "maxResults": 1,
-            "marketProjection": ["MARKET_START_TIME", "EVENT"],
-        }
-        result = self._rpc("listMarketCatalogue", params)
-        if not result:
-            return None
-
-        open_date_str = result[0]["event"]["openDate"]
-        # Example: "2025-12-02T13:40:00.000Z"
-        if open_date_str.endswith("Z"):
-            open_date_str = open_date_str.replace("Z", "+00:00")
-
-        try:
-            dt_obj = dt.datetime.fromisoformat(open_date_str)
-        except Exception as e:
-            print("[BETFAIR] Error parsing openDate:", e, "raw:", result[0]["event"]["openDate"])
-            return None
-
-        # Ensure timezone-aware (should already be with +00:00)
-        if dt_obj.tzinfo is None:
-            dt_obj = dt_obj.replace(tzinfo=dt.timezone.utc)
-        return dt_obj
+        event = m.get("event") or {}
+        venue = event.get("venue", "").strip()
+        market_name = m.get("marketName", "").strip()
+        if venue:
+            return f"{venue} {market_name}"
+        return market_name or market_id
 
     def get_top_two_favourites(self, market_id: str) -> List[Dict[str, Any]]:
         """
@@ -276,10 +259,10 @@ class BetfairClient:
             "marketProjection": ["RUNNER_DESCRIPTION"],
         }
         cat_res = self._rpc("listMarketCatalogue", cat_params)
-        runner_name_map = {}
+        runner_name_map: Dict[int, str] = {}
         if cat_res:
             for r in cat_res[0].get("runners", []):
-                runner_name_map[r["selectionId"]] = r["runnerName"]
+                runner_name_map[r["selectionId"]] = r.get("runnerName", str(r["selectionId"]))
 
         # 2) Get prices from MarketBook
         book_params = {
@@ -294,7 +277,7 @@ class BetfairClient:
             return []
 
         runners = book_res[0].get("runners", [])
-        priced = []
+        priced: List[Dict[str, Any]] = []
 
         for r in runners:
             sel_id = r["selectionId"]
@@ -360,87 +343,6 @@ class BetfairClient:
         print("[BETFAIR] Account funds:", funds)
         return funds
 
-    def place_dutch_bets(
-        self,
-        market_id: str,
-        favs: List[Dict[str, Any]],
-        stake1: float,
-        stake2: float,
-    ) -> Optional[Dict[str, Any]]:
-        """
-        Place 2 BACK limit bets (one on each favourite) using Betfair placeOrders.
-
-        - stakes are in account currency (assume GBP)
-        - prices are taken from favs[i]['back']
-        - safety: total stake is capped by self.max_total_stake
-
-        Returns the API result dict on success, or None if dummy mode or no stake.
-        """
-
-        if self.use_dummy:
-            print("[BETFAIR] Dummy mode: NOT placing real bets.")
-            print(
-                f"[BETFAIR] Would place BACK bets on {market_id}: "
-                f"s1={stake1:.2f}, s2={stake2:.2f}"
-            )
-            return None
-
-        # Sanity: stakes must be > 0
-        stake1 = max(0.0, float(stake1))
-        stake2 = max(0.0, float(stake2))
-        total = stake1 + stake2
-
-        if total <= 0:
-            print("[BETFAIR] place_dutch_bets: total stake <= 0, nothing to do.")
-            return None
-
-        # Safety cap
-        if total > self.max_total_stake:
-            scale = self.max_total_stake / total
-            print(
-                f"[BETFAIR] place_dutch_bets: scaling stakes down to safety cap "
-                f"{self.max_total_stake:.2f} (from {total:.2f})."
-            )
-            stake1 *= scale
-            stake2 *= scale
-            total = stake1 + stake2
-
-        # Build instructions
-        instructions = []
-        for fav, stake in zip(favs, (stake1, stake2)):
-            if stake <= 0:
-                continue
-            price = float(fav["back"])
-            selection_id = fav["selection_id"]
-
-            instructions.append(
-                {
-                    "selectionId": selection_id,
-                    "handicap": 0,
-                    "side": "BACK",
-                    "orderType": "LIMIT",
-                    "limitOrder": {
-                        "size": round(stake, 2),
-                        "price": round(price, 2),
-                        "persistenceType": "LAPSE",
-                    },
-                }
-            )
-
-        if not instructions:
-            print("[BETFAIR] place_dutch_bets: no valid instructions after checks.")
-            return None
-
-        params = {
-            "marketId": market_id,
-            "instructions": instructions,
-            "customerRef": f"dutch_{market_id}",
-        }
-
-        print(f"[BETFAIR] Sending placeOrders for market {market_id}: {instructions}")
-        result = self._rpc("placeOrders", params)
-        print("[BETFAIR] placeOrders result:", result)
-        return result
 
 
 
