@@ -3,14 +3,14 @@
 # BetfairClient with dummy mode + real API-NG integration for:
 # - get_todays_novice_hurdle_markets()
 # - get_market_name()
+# - get_market_start_time()
 # - get_top_two_favourites()
 # - get_account_funds()
 
 import os
 import datetime as dt
-from typing import List, Dict, Any, Optional
-
 import requests
+from typing import List, Dict, Any, Optional
 
 
 BETTING_ENDPOINT = "https://api.betfair.com/exchange/betting/json-rpc/v1"
@@ -52,7 +52,7 @@ class BetfairClient:
         headers = {
             "X-Application": self.app_key,
             "Content-Type": "application/x-www-form-urlencoded",
-            "Accept": "application/json",  # ask explicitly for JSON
+            "Accept": "application/json",
         }
         data = {
             "username": self.username,
@@ -63,7 +63,6 @@ class BetfairClient:
         resp = requests.post(IDENTITY_ENDPOINT, headers=headers, data=data, timeout=10)
         print(f"[BETFAIR] Login HTTP status: {resp.status_code}")
 
-        # Try JSON first, but fall back to raw text so we can see errors
         try:
             js = resp.json()
             print("[BETFAIR] Raw JSON login response:", js)
@@ -147,13 +146,7 @@ class BetfairClient:
     def get_todays_novice_hurdle_markets(self) -> List[Dict[str, Any]]:
         """
         Returns a list of dicts: { 'market_id': str, 'name': str }
-
-        Looser matching:
-        - Horse Racing (eventType 7)
-        - GB / IE
-        - WIN markets
-        - marketName includes something hurdle-ish (hurdle / hurd / hdle)
-        - and something novice-ish (nov / novice)
+        For now: UK & IRE horse racing, marketType = 'WIN', with 'Novice' + 'Hurdle/Hrd' in name.
         """
         if self.use_dummy:
             print("[BETFAIR] Returning DUMMY novice hurdle markets.")
@@ -163,7 +156,7 @@ class BetfairClient:
                 {"market_id": "1.234567893", "name": "Dummy Novice Hurdle 15:15"},
             ]
 
-        print("[BETFAIR] Fetching REAL 'novice-style' hurdle WIN markets for today from API.")
+        print("[BETFAIR] Fetching REAL novice hurdle markets for today from API.")
 
         # Build a "today" time range in UTC
         now_utc = dt.datetime.utcnow()
@@ -181,38 +174,23 @@ class BetfairClient:
                 },
             },
             "maxResults": 200,
-            "marketProjection": ["MARKET_START_TIME", "EVENT"],
+            "marketProjection": ["MARKET_START_TIME", "EVENT", "RUNNER_DESCRIPTION"],
         }
 
         result = self._rpc("listMarketCatalogue", params)
-        markets: List[Dict[str, Any]] = []
+        markets = []
 
         for m in result:
-            raw_name = m.get("marketName", "") or ""
-            name = raw_name.strip()
-            ln = name.lower()
-
-            is_hurdle = any(x in ln for x in ["hurdle", "hurd", "hdle"])
-            is_noviceish = any(x in ln for x in ["nov", "novice"])
-
-            # Debug logs to see borderline names
-            if is_hurdle and not is_noviceish:
-                print(f"[BETFAIR][DEBUG] Hurdle but not novice-ish: {name}")
-            if is_noviceish and not is_hurdle:
-                print(f"[BETFAIR][DEBUG] Novice-ish but not hurdle: {name}")
-
-            if is_hurdle and is_noviceish:
-                venue = (m.get("event") or {}).get("venue", "").strip()
-                open_date = (m.get("event") or {}).get("openDate", "")
-                nice_name = f"{venue} {name} ({open_date})".strip()
+            name = m.get("marketName", "")
+            if "Novice" in name and ("Hurdle" in name or "Hrd" in name):
                 markets.append(
                     {
                         "market_id": m["marketId"],
-                        "name": nice_name,
+                        "name": f"{m['event']['venue']} {name} ({m['event']['openDate']})",
                     }
                 )
 
-        print(f"[BETFAIR] Found {len(markets)} novice-style hurdle WIN markets today.")
+        print(f"[BETFAIR] Found {len(markets)} novice hurdle WIN markets today.")
         return markets
 
     def get_market_name(self, market_id: str) -> str:
@@ -231,12 +209,40 @@ class BetfairClient:
         if not result:
             return market_id
         m = result[0]
-        event = m.get("event") or {}
-        venue = event.get("venue", "").strip()
-        market_name = m.get("marketName", "").strip()
-        if venue:
-            return f"{venue} {market_name}"
-        return market_name or market_id
+        return f"{m['event']['venue']} {m['marketName']}"
+
+    def get_market_start_time(self, market_id: str) -> dt.datetime:
+        """
+        Return the scheduled market start time as a timezone-aware UTC datetime.
+        Used for the '1 minute before off' auto-bet timing.
+        """
+        if self.use_dummy:
+            # For dummy mode, pretend the race is 10 minutes from now
+            return dt.datetime.utcnow().replace(microsecond=0) + dt.timedelta(minutes=10)
+
+        params = {
+            "filter": {"marketIds": [market_id]},
+            "maxResults": 1,
+            "marketProjection": ["MARKET_START_TIME"],
+        }
+        result = self._rpc("listMarketCatalogue", params)
+        if not result:
+            raise RuntimeError(f"No marketStartTime found for market {market_id}")
+
+        raw = result[0].get("marketStartTime")
+        if not raw:
+            raise RuntimeError(f"Missing marketStartTime in catalogue for {market_id}")
+
+        # Convert ISO8601 string (with 'Z') to aware UTC datetime
+        if raw.endswith("Z"):
+            raw = raw.replace("Z", "+00:00")
+        start = dt.datetime.fromisoformat(raw)
+        if start.tzinfo is None:
+            start = start.replace(tzinfo=dt.timezone.utc)
+        else:
+            start = start.astimezone(dt.timezone.utc)
+
+        return start
 
     def get_top_two_favourites(self, market_id: str) -> List[Dict[str, Any]]:
         """
@@ -259,10 +265,10 @@ class BetfairClient:
             "marketProjection": ["RUNNER_DESCRIPTION"],
         }
         cat_res = self._rpc("listMarketCatalogue", cat_params)
-        runner_name_map: Dict[int, str] = {}
+        runner_name_map = {}
         if cat_res:
             for r in cat_res[0].get("runners", []):
-                runner_name_map[r["selectionId"]] = r.get("runnerName", str(r["selectionId"]))
+                runner_name_map[r["selectionId"]] = r["runnerName"]
 
         # 2) Get prices from MarketBook
         book_params = {
@@ -277,7 +283,7 @@ class BetfairClient:
             return []
 
         runners = book_res[0].get("runners", [])
-        priced: List[Dict[str, Any]] = []
+        priced = []
 
         for r in runners:
             sel_id = r["selectionId"]
@@ -342,6 +348,7 @@ class BetfairClient:
         }
         print("[BETFAIR] Account funds:", funds)
         return funds
+
 
 
 

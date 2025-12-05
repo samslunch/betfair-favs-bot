@@ -34,8 +34,8 @@ class StrategyState:
     # --- Last race calc ---
     last_total_stake: float = 0.0
 
-    # --- Optional history log so UI / other code can inspect past races ---
-    #     Each entry: { "market_id", "market_name", "pnl", "bank_after", "timestamp" }
+     # --- History (this is the important bit) ---
+    # each item: {"market_id", "market_name", "pnl", "bank_after", "timestamp"}
     history: List[Dict[str, Any]] = field(default_factory=list)
 
 
