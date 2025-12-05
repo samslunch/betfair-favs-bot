@@ -34,8 +34,11 @@ class StrategyState:
     # --- Last race calc ---
     last_total_stake: float = 0.0
 
-     # --- History (this is the important bit) ---
-    # each item: {"market_id", "market_name", "pnl", "bank_after", "timestamp"}
+    # --- Timing for auto-bet window ---
+    current_market_start: Optional[datetime] = None
+    bet_placed_for_current: bool = False
+
+    # --- Optional history log (not shown in UI yet, but kept for future) ---
     history: List[Dict[str, Any]] = field(default_factory=list)
 
 
@@ -68,7 +71,8 @@ class ProgressionStrategy:
         s.losses_so_far = 0.0
         s.day_done = False
         s.last_total_stake = 0.0
-        # keep s.current_bank as-is; you can reset it from the UI
+        s.current_market_start = None
+        s.bet_placed_for_current = False
 
         if s.selected_market_ids:
             s.current_index = 0
@@ -83,6 +87,9 @@ class ProgressionStrategy:
         If index is out of range, mark day as done.
         """
         s = self.state
+        s.current_market_start = None
+        s.bet_placed_for_current = False
+
         if not s.selected_market_ids:
             s.current_market_id = None
             s.current_market_name = None
@@ -148,7 +155,6 @@ class ProgressionStrategy:
         k1 = odds1 - 1.0
         k2 = odds2 - 1.0
 
-        # prevent division by zero / nonsense odds
         if k1 <= 0 or k2 <= 0:
             print("[STRATEGY] invalid odds, returning zero stakes.")
             return 0.0, 0.0, 0.0, 0.0
@@ -157,18 +163,12 @@ class ProgressionStrategy:
         inv2 = 1.0 / k2
         inv_sum = inv1 + inv2
 
-        # using standard dutching:
-        #  Let R be gross return if either wins:
-        #   stake1 = R / (odds1 - 1)
-        #   stake2 = R / (odds2 - 1)
-        #   total = stake1 + stake2 = R * inv_sum
-        #   profit = R - total = R * (1 - inv_sum)
-        #  => R = target_profit / (1 - inv_sum)
         if inv_sum >= 1.0:
             # You can't get positive profit with this combination of odds
             print("[STRATEGY] inv_sum >= 1; dutch not feasible for positive profit.")
             return 0.0, 0.0, 0.0, 0.0
 
+        # See derivation in earlier message
         R = target_profit / (1.0 - inv_sum)
         stake1 = R * inv1
         stake2 = R * inv2
@@ -182,7 +182,6 @@ class ProgressionStrategy:
             total_stake *= scale
             target_profit *= scale  # actual achievable profit
 
-        # Store last total stake so the UI / bot can treat that as the "risk" used
         s.last_total_stake = total_stake
 
         return stake1, stake2, total_stake, target_profit
@@ -217,7 +216,6 @@ class ProgressionStrategy:
         s.last_total_stake = 0.0
         self._record_history(pnl)
 
-        # Stop for the day after first winner (your requested behaviour)
         s.day_done = True
         print(f"[STRATEGY] Day done after win. Bank now {s.current_bank:.2f}, P/L {s.todays_pl:.2f}")
 
@@ -233,13 +231,11 @@ class ProgressionStrategy:
         s.todays_pl += pnl
         s.races_played += 1
 
-        # increase loss accumulator
         loss = -pnl if pnl < 0 else 0.0
         s.losses_so_far += loss
         s.last_total_stake = 0.0
         self._record_history(pnl)
 
-        # Check daily loss limit
         if s.todays_pl <= -abs(s.max_daily_loss):
             s.day_done = True
             print(
@@ -247,7 +243,6 @@ class ProgressionStrategy:
                 "Day done."
             )
         else:
-            # We do NOT increment current_index here — BotRunner handles moving to next race
             print(
                 f"[STRATEGY] Loss recorded. losses_so_far={s.losses_so_far:.2f}, "
                 f"bank={s.current_bank:.2f}, today's P/L={s.todays_pl:.2f}"
