@@ -424,7 +424,8 @@ def render_dashboard(message: str = ""):
 
     # History panel HTML (last 10 races)
     history_rows = ""
-    recent_history = list(state.history)[-10:][::-1]  # newest first
+    recent_history = list(getattr(state, "history", []))[-10:][::-1]  # newest first
+
     for h in recent_history:
         pnl_color = "#22c55e" if h["pnl"] >= 0 else "#ef4444"
         history_rows += f"""
