@@ -1,347 +1,254 @@
-# betfair_client.py
+# strategy.py
 #
-# BetfairClient with:
-#   - login via identitysso
-#   - listMarketCatalogue (for market names + start times)
-#   - listMarketBook (for favourites)
-#   - getAccountFunds (balance)
-#   - get_todays_novice_hurdle_markets() with super-flexible detection
+# StrategyState + BotRunner for the Betfair 2-fav dutching bot.
 #
-# Environment variables required:
-#   BETFAIR_APP_KEY
-#   BETFAIR_USERNAME
-#   BETFAIR_PASSWORD
+# This version:
+#   - Keeps track of bank, target, odds limits, selected markets, etc.
+#   - Schedules each race: "seconds_before_off" before off time.
+#   - Fetches top 2 favourites and calculates dutching stakes (equal profit).
+#   - Does NOT place real bets (logging / UI only).
+#   - Lets the UI call race_won / race_lost to update bank and history.
 
-import os
+from __future__ import annotations
+
+import asyncio
 import datetime as dt
-from typing import List, Dict, Any, Optional
-import requests
-
-BETTING_ENDPOINT = "https://api.betfair.com/exchange/betting/json-rpc/v1"
-ACCOUNT_ENDPOINT = "https://api.betfair.com/exchange/account/json-rpc/v1"
-IDENTITY_ENDPOINT = "https://identitysso.betfair.com/api/login"
+from dataclasses import dataclass, field
+from typing import List, Optional, Deque, Dict, Any
+from collections import deque
 
 
-class BetfairClient:
-    def __init__(self, use_dummy: bool = True):
-        """
-        use_dummy=True  -> bot runs in safe offline simulation mode
-        use_dummy=False -> real Betfair API (requires app key + credentials)
-        """
-        self.use_dummy = use_dummy
-        self.app_key = os.getenv("BETFAIR_APP_KEY", "")
-        self.username = os.getenv("BETFAIR_USERNAME", "")
-        self.password = os.getenv("BETFAIR_PASSWORD", "")
-        self.session_token: Optional[str] = None
+@dataclass
+class StrategyState:
+    # Bank & staking
+    starting_bank: float = 100.0
+    bank: float = 100.0
+    target_profit: float = 5.0
+    stake_percent: float = 5.0  # % of bank per race
 
-        print(f"[BETFAIR] Initialising client. use_dummy={self.use_dummy}")
-        print(
-            f"[BETFAIR] APP_KEY set: {bool(self.app_key)} | "
-            f"USERNAME set: {bool(self.username)}"
-        )
+    # Odds filters
+    min_odds: float = 1.5
+    max_odds: float = 4.5
 
-        if not self.use_dummy:
-            self._login()
+    # Timing: when to place bets relative to off
+    seconds_before_off: int = 60
 
-    # -------------------------------------------------------------------------
-    # LOGIN
-    # -------------------------------------------------------------------------
+    # Race sequence
+    selected_markets: List[str] = field(default_factory=list)
+    current_index: int = 0
+    running: bool = False
+    current_market_id: Optional[str] = None
 
-    def _login(self):
-        """Login using Betfair's identitysso (interactive login)."""
-        if not (self.app_key and self.username and self.password):
-            raise RuntimeError(
-                "BETFAIR_APP_KEY / BETFAIR_USERNAME / BETFAIR_PASSWORD env vars not set"
-            )
+    # For P/L and display
+    history: Deque[Dict[str, Any]] = field(default_factory=lambda: deque(maxlen=100))
+    last_total_stake: float = 0.0
+    last_favourites: Optional[List[Dict[str, Any]]] = None
 
-        headers = {
-            "X-Application": self.app_key,
-            "Content-Type": "application/x-www-form-urlencoded",
-            "Accept": "application/json",
-        }
 
-        data = {
-            "username": self.username,
-            "password": self.password,
-        }
+class BotRunner:
+    """
+    Simple async loop that:
+      - walks through state.selected_markets in order
+      - waits until (off - seconds_before_off)
+      - fetches top 2 favourites & calculates dutching stakes
+      - waits for manual "Race WON/LOST" buttons to be pressed in the UI
+    """
 
-        print("[BETFAIR] Logging in via identitysso...")
-        resp = requests.post(IDENTITY_ENDPOINT, headers=headers, data=data, timeout=10)
-        print(f"[BETFAIR] Login status code: {resp.status_code}")
+    def __init__(self, client, state: StrategyState):
+        self.client = client
+        self.state = state
+        self._task: Optional[asyncio.Task] = None
 
-        try:
-            js = resp.json()
-            print("[BETFAIR] Login JSON response:", js)
-        except Exception:
-            print("[BETFAIR] Login was NOT JSON. Body:")
-            print(resp.text[:500])
-            raise RuntimeError("Betfair login failed (non-JSON response).")
+    # -------------------------
+    # Public control methods
+    # -------------------------
 
-        if js.get("status") != "SUCCESS":
-            raise RuntimeError(f"Betfair login failure: {js}")
+    def start(self) -> None:
+        if self.state.running:
+            print("[BOT] Already running.")
+            return
+        if not self.state.selected_markets:
+            print("[BOT] Cannot start: no markets selected.")
+            return
 
-        self.session_token = js["token"]
-        print("[BETFAIR] Login OK, session token acquired.")
+        self.state.running = True
+        # Reset index if we've run out
+        if self.state.current_index >= len(self.state.selected_markets):
+            self.state.current_index = 0
 
-    def _headers(self) -> Dict[str, str]:
-        if self.use_dummy:
-            return {}
-        if not self.session_token:
-            self._login()
-        return {
-            "X-Application": self.app_key,
-            "X-Authentication": self.session_token,
-            "Content-Type": "application/json",
-        }
+        # Create a background task on the current event loop
+        loop = asyncio.get_event_loop()
+        self._task = loop.create_task(self._run_loop())
+        print("[BOT] Loop started.")
 
-    def _rpc(self, method: str, params: Dict[str, Any]) -> Any:
-        """Low-level JSON-RPC wrapper for betting API."""
-        payload = {
-            "jsonrpc": "2.0",
-            "method": f"SportsAPING/v1.0/{method}",
-            "params": params,
-            "id": 1,
-        }
-        resp = requests.post(
-            BETTING_ENDPOINT, headers=self._headers(), json=payload, timeout=10
-        )
-        print(f"[BETFAIR] RPC {method} → {resp.status_code}")
-        js = resp.json()
-        if "error" in js:
-            raise RuntimeError(f"Betfair API error: {js['error']}")
-        return js["result"]
+    def stop(self) -> None:
+        self.state.running = False
+        if self._task and not self._task.done():
+            self._task.cancel()
+        print("[BOT] Stop requested")
 
-    def _account_rpc(self, method: str, params: Dict[str, Any]) -> Any:
-        """Low-level JSON-RPC wrapper for account API."""
-        payload = {
-            "jsonrpc": "2.0",
-            "method": f"AccountAPING/v1.0/{method}",
-            "params": params,
-            "id": 1,
-        }
-        resp = requests.post(
-            ACCOUNT_ENDPOINT, headers=self._headers(), json=payload, timeout=10
-        )
-        print(f"[BETFAIR] ACCOUNT {method} → {resp.status_code}")
-        js = resp.json()
-        if "error" in js:
-            raise RuntimeError(f"Betfair Account API error: {js['error']}")
-        return js["result"]
+    def mark_race_won(self) -> None:
+        self._record_result(won=True)
 
-    # -------------------------------------------------------------------------
-    # MARKET SEARCH (SUPER FLEXIBLE NOVICE HURDLE)
-    # -------------------------------------------------------------------------
+    def mark_race_lost(self) -> None:
+        self._record_result(won=False)
 
-    def get_todays_novice_hurdle_markets(self) -> List[Dict[str, Any]]:
-        """
-        SUPER FLEXIBLE NOVICE HURDLE DETECTION
-        --------------------------------------
-        1) Fetch ALL horse racing markets (no country/type filter).
-        2) Filter by event date == today.
-        3) Novice hurdle detection uses many patterns:
-              novice, nov , nov., nov hrd
-              hurdle, hurd, hrd
-        4) If any novice hurdles exist → return those.
-        5) Otherwise → return all horse races today.
-        6) If still empty → return all markets.
-        """
+    # -------------------------
+    # Internal main loop
+    # -------------------------
 
-        if self.use_dummy:
-            print("[BETFAIR] DUMMY novice hurdles (sim mode).")
-            return [
-                {"market_id": "1.111", "name": "Dummy Novice Hurdle 13:30"},
-                {"market_id": "1.112", "name": "Dummy Novice Hurdle 14:05"},
-                {"market_id": "1.113", "name": "Dummy Novice Hurdle 15:15"},
-            ]
+    async def _run_loop(self) -> None:
+        while self.state.running:
+            if self.state.current_index >= len(self.state.selected_markets):
+                print("[STRATEGY] No markets selected – day done.")
+                self.state.running = False
+                break
 
-        print("[BETFAIR] Fetching REAL horse markets (relaxed).")
+            market_id = self.state.selected_markets[self.state.current_index]
+            self.state.current_market_id = market_id
 
-        today_utc = dt.datetime.utcnow().date()
-
-        params = {
-            "filter": {"eventTypeIds": ["7"]},  # ALL horse racing
-            "maxResults": 200,
-            "marketProjection": ["MARKET_START_TIME", "EVENT"],
-        }
-
-        try:
-            result = self._rpc("listMarketCatalogue", params)
-        except Exception as e:
-            print("[BETFAIR] Error in listMarketCatalogue:", e)
-            return []
-
-        print(f"[BETFAIR] Received {len(result)} markets total.")
-
-        # Log some examples (so we know what Betfair actually names things)
-        print("[BETFAIR] Sample market names:")
-        for i, m in enumerate(result[:20]):
-            print("   ", i + 1, m.get("marketName", ""), "| event:", m.get("event", {}))
-
-        all_any = []
-        all_today = []
-        novice_today = []
-
-        for m in result:
-            name = m.get("marketName", "").lower()
-            event = m.get("event", {})
-            venue = event.get("venue", "")
-            open_date_str = event.get("openDate", "")
-
-            nice = f"{venue} {m.get('marketName','')} ({open_date_str})".strip()
-            entry = {
-                "market_id": m["marketId"],
-                "name": nice,
-            }
-            all_any.append(entry)
-
-            # Try to parse the event date
-            event_date = None
+            # Fetch market info
             try:
-                s = open_date_str
-                if s.endswith("Z"):
-                    s = s.replace("Z", "+00:00")
-                dt_val = dt.datetime.fromisoformat(s)
-                event_date = dt_val.date()
-            except Exception:
-                pass
+                start_time = self.client.get_market_start_time(market_id)
+                market_name = self.client.get_market_name(market_id)
+            except Exception as e:
+                print("[BOT] Error fetching market info:", e)
+                self._advance_market()
+                continue
 
-            if event_date == today_utc:
-                all_today.append(entry)
+            # Work in UTC
+            now = dt.datetime.utcnow().replace(tzinfo=dt.timezone.utc)
+            if start_time.tzinfo is None:
+                start_time = start_time.replace(tzinfo=dt.timezone.utc)
+            else:
+                start_time = start_time.astimezone(dt.timezone.utc)
 
-                # SUPER FLEXIBLE novice hurdle detection
-                is_hurdle = (
-                    "hurdle" in name or "hurd" in name or "hrd" in name
+            # How long until we want to "act"?
+            seconds_to_off = (start_time - now).total_seconds()
+            seconds_to_action = seconds_to_off - self.state.seconds_before_off
+
+            if seconds_to_action > 0:
+                # Sleep in chunks so stop() can cut in
+                sleep_for = min(seconds_to_action, 60)
+                print(
+                    f"[BOT] Waiting {sleep_for:.0f}s before checking prices for "
+                    f"{market_name} ({market_id}). Off in {seconds_to_off:.0f}s."
                 )
-                is_novice = (
-                    "novice" in name or "nov " in name or "nov." in name or "nov hrd" in name
-                )
-                if is_hurdle and is_novice:
-                    novice_today.append(entry)
+                try:
+                    await asyncio.sleep(sleep_for)
+                except asyncio.CancelledError:
+                    print("[BOT] Loop cancelled while waiting.")
+                    return
+                continue
+
+            # Time to "place bets" (log only)
+            try:
+                favs = self.client.get_top_two_favourites(market_id)
+            except Exception as e:
+                print("[BOT] Error getting favourites:", e)
+                self._advance_market()
+                continue
+
+            if len(favs) < 2:
+                print("[BOT] Fewer than 2 runners with usable prices, skipping market.")
+                self._advance_market()
+                continue
+
+            # Apply odds filters to top 2
+            favs_in_range = [
+                f for f in favs
+                if self.state.min_odds <= f["back"] <= self.state.max_odds
+            ]
+            if len(favs_in_range) < 2:
+                print("[BOT] Top 2 favourites out of odds range, skipping.")
+                self._advance_market()
+                continue
+
+            total_stake = self.state.bank * (self.state.stake_percent / 100.0)
+            if total_stake <= 0:
+                print("[BOT] Non-positive stake; stopping.")
+                self.state.running = False
+                break
+
+            o1 = favs_in_range[0]["back"]
+            o2 = favs_in_range[1]["back"]
+            inv_sum = (1.0 / o1) + (1.0 / o2)
+            stake1 = total_stake * (1.0 / o1) / inv_sum
+            stake2 = total_stake - stake1
+
+            self.state.last_total_stake = total_stake
+            self.state.last_favourites = favs_in_range
+
+            print(
+                f"[BOT] READY: {market_name} ({market_id})\n"
+                f"      Stake total £{total_stake:.2f}\n"
+                f"      £{stake1:.2f} on {favs_in_range[0]['name']} @ {o1}\n"
+                f"      £{stake2:.2f} on {favs_in_range[1]['name']} @ {o2}\n"
+                f"      {self.state.seconds_before_off}s before off. (NO REAL BETS PLACED)"
+            )
+
+            # Now wait here until the UI marks this race as WON/LOST or bot is stopped
+            try:
+                while (
+                    self.state.running
+                    and self.state.current_market_id == market_id
+                ):
+                    await asyncio.sleep(1.0)
+            except asyncio.CancelledError:
+                print("[BOT] Loop cancelled while waiting for race result.")
+                return
+
+        print("[BOT] Loop finished.")
+
+    # -------------------------
+    # Helpers
+    # -------------------------
+
+    def _advance_market(self) -> None:
+        self.state.current_index += 1
+        self.state.current_market_id = None
+        self.state.last_favourites = None
+        self.state.last_total_stake = 0.0
+
+    def _record_result(self, won: bool) -> None:
+        market_id = self.state.current_market_id
+        if not market_id or not self.state.last_favourites:
+            print("[BOT] No active market to record result for.")
+            return
+
+        try:
+            race_name = self.client.get_market_name(market_id)
+        except Exception:
+            race_name = market_id
+
+        total_stake = self.state.last_total_stake
+        favs = self.state.last_favourites
+
+        if won:
+            # Approx equal-profit dutch based on back odds
+            o1 = favs[0]["back"]
+            o2 = favs[1]["back"]
+            inv_sum = (1.0 / o1) + (1.0 / o2)
+            profit_each = total_stake / inv_sum - total_stake
+            pl = profit_each
+        else:
+            pl = -total_stake
+
+        self.state.bank += pl
+
+        entry = {
+            "race_name": race_name,
+            "favs": f"{favs[0]['name']} / {favs[1]['name']}",
+            "total_stake": total_stake,
+            "pl": pl,
+            "won": won,
+        }
+        self.state.history.append(entry)
 
         print(
-            f"[BETFAIR] Summary: {len(all_any)} total | "
-            f"{len(all_today)} today | {len(novice_today)} novice hurdles"
+            f"[BOT] RESULT: {race_name} => {'WON' if won else 'LOST'} | "
+            f"P/L £{pl:.2f} | bank now £{self.state.bank:.2f}"
         )
 
-        if novice_today:
-            print("[BETFAIR] Returning NOVICE HURDLE markets.")
-            return novice_today
-
-        if all_today:
-            print("[BETFAIR] No novice hurdles – returning ALL TODAY'S races.")
-            return all_today
-
-        print("[BETFAIR] No today's races detected – returning ALL horse markets.")
-        return all_any
-
-    # -------------------------------------------------------------------------
-    # MARKET DETAILS
-    # -------------------------------------------------------------------------
-
-    def get_market_name(self, market_id: str) -> str:
-        if self.use_dummy:
-            return f"Dummy Market {market_id}"
-        params = {
-            "filter": {"marketIds": [market_id]},
-            "maxResults": 1,
-            "marketProjection": ["MARKET_START_TIME", "EVENT"],
-        }
-        res = self._rpc("listMarketCatalogue", params)
-        if not res:
-            return market_id
-        m = res[0]
-        return f"{m['event']['venue']} {m['marketName']}"
-
-    def get_market_start_time(self, market_id: str) -> dt.datetime:
-        if self.use_dummy:
-            return dt.datetime.utcnow() + dt.timedelta(minutes=10)
-
-        params = {
-            "filter": {"marketIds": [market_id]},
-            "maxResults": 1,
-            "marketProjection": ["MARKET_START_TIME"],
-        }
-        res = self._rpc("listMarketCatalogue", params)
-        if not res:
-            raise RuntimeError("Cannot fetch market start time")
-
-        raw = res[0].get("marketStartTime")
-        if raw.endswith("Z"):
-            raw = raw.replace("Z", "+00:00")
-        t = dt.datetime.fromisoformat(raw)
-        return t.astimezone(dt.timezone.utc)
-
-    # -------------------------------------------------------------------------
-    # FAVOURITES
-    # -------------------------------------------------------------------------
-
-    def get_top_two_favourites(self, market_id: str) -> List[Dict[str, Any]]:
-        if self.use_dummy:
-            return [
-                {"selection_id": 1, "name": "Dummy Fav", "back": 2.4, "lay": 2.46},
-                {"selection_id": 2, "name": "Dummy 2nd", "back": 3.2, "lay": 3.3},
-            ]
-
-        # First get runner names
-        cat_params = {
-            "filter": {"marketIds": [market_id]},
-            "maxResults": 1,
-            "marketProjection": ["RUNNER_DESCRIPTION"],
-        }
-        cat = self._rpc("listMarketCatalogue", cat_params)
-        name_map = {
-            r["selectionId"]: r["runnerName"]
-            for r in cat[0].get("runners", [])
-        }
-
-        # Then get prices
-        book_params = {
-            "marketIds": [market_id],
-            "priceProjection": {
-                "priceData": ["EX_BEST_OFFERS"],
-                "virtualise": True,
-            },
-        }
-        book = self._rpc("listMarketBook", book_params)
-        runners = []
-        for r in book[0].get("runners", []):
-            ex = r.get("ex", {})
-            backs = ex.get("availableToBack", [])
-            lays = ex.get("availableToLay", [])
-            if not backs or not lays:
-                continue
-            runners.append(
-                {
-                    "selection_id": r["selectionId"],
-                    "name": name_map.get(r["selectionId"], str(r["selectionId"])),
-                    "back": backs[0]["price"],
-                    "lay": lays[0]["price"],
-                }
-            )
-        runners.sort(key=lambda x: x["back"])
-        return runners[:2]
-
-    # -------------------------------------------------------------------------
-    # ACCOUNT FUNDS
-    # -------------------------------------------------------------------------
-
-    def get_account_funds(self) -> Dict[str, Optional[float]]:
-        if self.use_dummy:
-            return {
-                "available_to_bet": 1000.0,
-                "exposure": 0.0,
-                "retained_commission": 0.0,
-                "exposure_limit": None,
-                "discount_rate": None,
-                "points_balance": None,
-            }
-
-        res = self._account_rpc("getAccountFunds", {})
-        return {
-            "available_to_bet": res.get("availableToBetBalance"),
-            "exposure": res.get("exposure"),
-            "retained_commission": res.get("retainedCommission"),
-            "exposure_limit": res.get("exposureLimit"),
-            "discount_rate": res.get("discountRate"),
-            "points_balance": res.get("pointsBalance"),
-        }
+        # Move on to the next race in sequence
+        self._advance_market()
