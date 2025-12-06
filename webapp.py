@@ -9,6 +9,7 @@
 #   - Race selection: today's horse markets from BetfairClient
 #   - Bot control: Start / Stop / Race WON / Race LOST
 #   - Simple recent P/L history
+#   - Debug route: /inspect_hurdles to inspect today's horse markets names
 #
 # Depends on:
 #   betfair_client.py  (BetfairClient)
@@ -18,6 +19,7 @@
 #   uvicorn webapp:app --host 0.0.0.0 --port 8000 --reload
 
 import os
+import datetime as dt
 from typing import Optional
 
 from fastapi import FastAPI, Request, Form
@@ -357,7 +359,8 @@ def render_dashboard(message: str = "") -> HTMLResponse:
                     <h1>Betfair 2-Fav Dutching Bot</h1>
                     <div class="sub">
                         Logged in as <strong>{ADMIN_USERNAME}</strong> |
-                        <a href="/logout">Log out</a>
+                        <a href="/logout">Log out</a> |
+                        <a href="/inspect_hurdles">Inspect Hurdles</a>
                     </div>
                 </div>
                 <div style="text-align:right;">
@@ -737,6 +740,116 @@ async def race_lost(request: Request):
         return render_dashboard(f"Error marking race as LOST: {e}")
 
     return render_dashboard("Race marked as LOST.")
+
+
+# --------------------------------------------------------
+# Debug route: inspect today's horse markets & novice hurdles
+# --------------------------------------------------------
+
+@app.get("/inspect_hurdles", response_class=HTMLResponse)
+async def inspect_hurdles(request: Request):
+    redirect = require_login(request)
+    if redirect:
+        return redirect
+
+    today_utc = dt.datetime.utcnow().date()
+    html_parts = []
+    html_parts.append("<html><head><title>Inspect Hurdles</title></head><body>")
+    html_parts.append(f"<h2>Horse markets for today (UTC date = {today_utc})</h2>")
+    html_parts.append("<p>This debug view shows exactly how Betfair names today's horse races.</p>")
+    html_parts.append("<p><a href='/'>⬅ Back to dashboard</a></p>")
+
+    if client.use_dummy:
+        html_parts.append("<p style='color:orange;'>Client is in DUMMY mode – switch to live to see real markets.</p>")
+        html_parts.append("</body></html>")
+        return HTMLResponse("".join(html_parts))
+
+    params = {
+        "filter": {"eventTypeIds": ["7"]},  # Horse Racing
+        "maxResults": 200,
+        "marketProjection": ["MARKET_START_TIME", "EVENT"],
+    }
+
+    try:
+        result = client._rpc("listMarketCatalogue", params)
+    except Exception as e:
+        html_parts.append(f"<p style='color:red;'>Error calling listMarketCatalogue: {e}</p>")
+        html_parts.append("</body></html>")
+        return HTMLResponse("".join(html_parts))
+
+    html_parts.append(f"<p>Betfair returned <strong>{len(result)}</strong> horse markets total.</p>")
+
+    rows = []
+    idx_today = 0
+
+    for m in result:
+        market_id = m.get("marketId")
+        market_name = m.get("marketName", "")
+        event = m.get("event", {}) or {}
+        event_name = event.get("name", "")
+        venue = event.get("venue", "")
+        open_date_str = event.get("openDate", "")
+
+        # Parse date → filter to today (UTC)
+        event_date = None
+        if open_date_str:
+            try:
+                s = open_date_str
+                if s.endswith("Z"):
+                    s = s.replace("Z", "+00:00")
+                dt_val = dt.datetime.fromisoformat(s)
+                event_date = dt_val.date()
+            except Exception:
+                event_date = None
+
+        if event_date != today_utc:
+            continue
+
+        idx_today += 1
+        lower_name = market_name.lower()
+
+        tags = []
+        if any(x in lower_name for x in ["hurdle", "hurd", "hrd"]):
+            tags.append("HURDLE")
+        if any(x in lower_name for x in ["novice", "nov ", "nov.", "nov hrd", "nov hdl", "nov hcap"]):
+            tags.append("NOVICE?")
+
+        tag_str = " | ".join(tags) if tags else ""
+        rows.append((market_id, event_name, venue, market_name, tag_str))
+
+    if idx_today == 0:
+        html_parts.append("<p style='color:orange;'>No horse markets with openDate == today (UTC) found.</p>")
+        html_parts.append("</body></html>")
+        return HTMLResponse("".join(html_parts))
+
+    html_parts.append(f"<p>Showing <strong>{idx_today}</strong> horse markets whose event date is today (UTC).</p>")
+    html_parts.append("""
+        <table border="1" cellspacing="0" cellpadding="4" style="font-size:0.8rem;border-color:#1f2937;">
+            <tr style="background:#111827;color:#e5e7eb;">
+                <th>#</th>
+                <th>Tags</th>
+                <th>MarketId</th>
+                <th>Event</th>
+                <th>Venue</th>
+                <th>Market Name</th>
+            </tr>
+    """)
+
+    for idx, (market_id, event_name, venue, market_name, tag_str) in enumerate(rows, 1):
+        tag_html = f"<span style='color:#f97316;'>{tag_str}</span>" if tag_str else ""
+        html_parts.append(f"""
+            <tr>
+                <td>{idx}</td>
+                <td>{tag_html}</td>
+                <td>{market_id}</td>
+                <td>{event_name}</td>
+                <td>{venue}</td>
+                <td>{market_name}</td>
+            </tr>
+        """)
+
+    html_parts.append("</table></body></html>")
+    return HTMLResponse("".join(html_parts))
 
 
 # --------------------------------------------------------
