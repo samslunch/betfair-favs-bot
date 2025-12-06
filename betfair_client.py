@@ -5,7 +5,7 @@
 #   - listMarketCatalogue (for markets, names, start times)
 #   - listMarketBook (for top two favourites)
 #   - getAccountFunds (Betfair balance)
-#   - get_todays_novice_hurdle_markets() with relaxed filter & fallback
+#   - get_todays_novice_hurdle_markets() with SUPER-relaxed filter & fallback
 #
 # Environment variables required (for live mode):
 #   BETFAIR_APP_KEY
@@ -30,7 +30,7 @@ class BetfairClient:
         use_dummy=True  -> no real API calls, returns fake data
         use_dummy=False -> real Betfair API-NG (needs env vars)
         """
-        print("[BETFAIR] Client version: 2025-12-06-FALLBACK-RELAXED")
+        print("[BETFAIR] Client version: 2025-12-06-SUPER-RELAXED")
         self.use_dummy = use_dummy
         self.app_key = os.getenv("BETFAIR_APP_KEY", "")
         self.username = os.getenv("BETFAIR_USERNAME", "")
@@ -158,11 +158,11 @@ class BetfairClient:
         Returns a list of dicts: { 'market_id': str, 'name': str }
 
         Strategy:
-          1) Ask Betfair for up to 200 UK/IRE WIN horse-racing markets (no time filter).
+          1) Ask Betfair for up to 200 HORSE RACING markets (eventTypeId=7), no country/type filter.
           2) Filter to "today" based on the event's openDate (UTC date).
           3) Inside that, prefer Novice Hurdle/Hrd markets.
-          4) If no novice hurdles today, fall back to all today's WIN markets.
-          5) If still nothing, fall back to all WIN markets returned.
+          4) If no novice hurdles today, fall back to all today's markets.
+          5) If still nothing, fall back to all horse markets returned.
         """
 
         if self.use_dummy:
@@ -173,15 +173,13 @@ class BetfairClient:
                 {"market_id": "1.234567893", "name": "Dummy Novice Hurdle 15:15"},
             ]
 
-        print("[BETFAIR] Fetching REAL novice hurdle markets (relaxed filter).")
+        print("[BETFAIR] Fetching REAL horse markets (SUPER-relaxed filter).")
 
         today_utc = dt.datetime.utcnow().date()
 
-        # Simpler filter: no time filter here; we filter by date ourselves.
+        # Super-relaxed: only filter by eventTypeIds (Horse Racing).
         base_filter = {
-            "eventTypeIds": ["7"],          # Horse Racing
-            "marketCountries": ["GB", "IE"],
-            "marketTypeCodes": ["WIN"],
+            "eventTypeIds": ["7"],  # Horse Racing
         }
 
         params = {
@@ -196,8 +194,10 @@ class BetfairClient:
             print("[BETFAIR] Error fetching market catalogue:", e)
             return []
 
-        all_any: List[Dict[str, Any]] = []        # all markets returned
-        all_today: List[Dict[str, Any]] = []      # only today's markets
+        print(f"[BETFAIR] listMarketCatalogue returned {len(result)} markets total.")
+
+        all_any: List[Dict[str, Any]] = []        # all horse markets
+        all_today: List[Dict[str, Any]] = []      # today's horse markets
         novice_today: List[Dict[str, Any]] = []   # today's Novice Hurdle markets
 
         for m in result:
@@ -232,21 +232,21 @@ class BetfairClient:
                     novice_today.append(entry)
 
         print(
-            f"[BETFAIR] Raw markets: {len(all_any)} total; "
-            f"{len(all_today)} for today; {len(novice_today)} novice hurdles today."
+            f"[BETFAIR] Horse markets summary: {len(all_any)} total; "
+            f"{len(all_today)} with openDate=today; {len(novice_today)} novice hurdles today."
         )
 
         # First choice: Novice hurdles today
         if novice_today:
             return novice_today
 
-        # Second choice: all today's WIN markets
+        # Second choice: all today's horse markets
         if all_today:
-            print("[BETFAIR] No novice hurdles today – using all WIN markets for today.")
+            print("[BETFAIR] No novice hurdles today – using all horse markets for today.")
             return all_today
 
         # Last resort: if somehow nothing matches "today", return everything
-        print("[BETFAIR] No markets matched today's date – returning all WIN markets.")
+        print("[BETFAIR] No markets matched today's date – returning ALL horse markets.")
         return all_any
 
     def get_market_name(self, market_id: str) -> str:
@@ -412,3 +412,4 @@ class BetfairClient:
         }
         print("[BETFAIR] Account funds:", funds)
         return funds
+
