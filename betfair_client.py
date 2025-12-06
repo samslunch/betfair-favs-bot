@@ -5,7 +5,7 @@
 #   - listMarketCatalogue (for markets, names, start times)
 #   - listMarketBook (for top two favourites)
 #   - getAccountFunds (Betfair balance)
-#   - get_todays_novice_hurdle_markets() with fallback to all WIN markets
+#   - get_todays_novice_hurdle_markets() with relaxed filter & fallback
 #
 # Environment variables required (for live mode):
 #   BETFAIR_APP_KEY
@@ -26,11 +26,11 @@ IDENTITY_ENDPOINT = "https://identitysso.betfair.com/api/login"
 
 class BetfairClient:
     def __init__(self, use_dummy: bool = True):
-        print("[BETFAIR] Client version: 2025-12-06-FALLBACK")
         """
         use_dummy=True  -> no real API calls, returns fake data
         use_dummy=False -> real Betfair API-NG (needs env vars)
         """
+        print("[BETFAIR] Client version: 2025-12-06-FALLBACK-RELAXED")
         self.use_dummy = use_dummy
         self.app_key = os.getenv("BETFAIR_APP_KEY", "")
         self.username = os.getenv("BETFAIR_USERNAME", "")
@@ -157,11 +157,14 @@ class BetfairClient:
         """
         Returns a list of dicts: { 'market_id': str, 'name': str }
 
-        Primary:   UK & IRE horse racing, marketType = 'WIN',
-                   with 'Novice' + 'Hurdle/Hrd' in name, from now until end of day.
-        Fallback:  If none found, return ALL WIN horse-racing markets for today
-                   (so the UI is never empty).
+        Strategy:
+          1) Ask Betfair for up to 200 UK/IRE WIN horse-racing markets (no time filter).
+          2) Filter to "today" based on the event's openDate (UTC date).
+          3) Inside that, prefer Novice Hurdle/Hrd markets.
+          4) If no novice hurdles today, fall back to all today's WIN markets.
+          5) If still nothing, fall back to all WIN markets returned.
         """
+
         if self.use_dummy:
             print("[BETFAIR] Returning DUMMY novice hurdle markets.")
             return [
@@ -170,20 +173,15 @@ class BetfairClient:
                 {"market_id": "1.234567893", "name": "Dummy Novice Hurdle 15:15"},
             ]
 
-        print("[BETFAIR] Fetching REAL novice hurdle markets for today from API.")
+        print("[BETFAIR] Fetching REAL novice hurdle markets (relaxed filter).")
 
-        now_utc = dt.datetime.utcnow()
-        start = now_utc
-        end_of_day = now_utc.replace(hour=23, minute=59, second=59, microsecond=0)
+        today_utc = dt.datetime.utcnow().date()
 
+        # Simpler filter: no time filter here; we filter by date ourselves.
         base_filter = {
-            "eventTypeIds": ["7"],  # Horse Racing
+            "eventTypeIds": ["7"],          # Horse Racing
             "marketCountries": ["GB", "IE"],
             "marketTypeCodes": ["WIN"],
-            "marketStartTime": {
-                "from": start.isoformat() + "Z",
-                "to": end_of_day.isoformat() + "Z",
-            },
         }
 
         params = {
@@ -198,38 +196,58 @@ class BetfairClient:
             print("[BETFAIR] Error fetching market catalogue:", e)
             return []
 
-        all_today: List[Dict[str, Any]] = []
-        novice_only: List[Dict[str, Any]] = []
+        all_any: List[Dict[str, Any]] = []        # all markets returned
+        all_today: List[Dict[str, Any]] = []      # only today's markets
+        novice_today: List[Dict[str, Any]] = []   # today's Novice Hurdle markets
 
         for m in result:
             name = m.get("marketName", "")
             event = m.get("event", {})
             venue = event.get("venue", "")
-            open_date = event.get("openDate", "")
+            open_date_str = event.get("openDate", "")
 
-            nice_name = f"{venue} {name} ({open_date})".strip()
-
+            nice_name = f"{venue} {name} ({open_date_str})".strip()
             entry = {
                 "market_id": m["marketId"],
                 "name": nice_name,
             }
-            all_today.append(entry)
+            all_any.append(entry)
 
-            # Primary: Novice Hurdle / Hrd in the market name
-            if "Novice" in name and ("Hurdle" in name or "Hrd" in name):
-                novice_only.append(entry)
+            # Parse event date (openDate is ISO 8601 string)
+            event_date = None
+            if open_date_str:
+                try:
+                    s = open_date_str
+                    if s.endswith("Z"):
+                        s = s.replace("Z", "+00:00")
+                    dt_val = dt.datetime.fromisoformat(s)
+                    event_date = dt_val.date()
+                except Exception:
+                    event_date = None
+
+            # Only keep "today" in all_today / novice_today
+            if event_date == today_utc:
+                all_today.append(entry)
+                if "Novice" in name and ("Hurdle" in name or "Hrd" in name):
+                    novice_today.append(entry)
 
         print(
-            f"[BETFAIR] Found {len(novice_only)} novice hurdles; "
-            f"{len(all_today)} total WIN markets in window."
+            f"[BETFAIR] Raw markets: {len(all_any)} total; "
+            f"{len(all_today)} for today; {len(novice_today)} novice hurdles today."
         )
 
-        # Prefer novice hurdles if any exist, otherwise fall back to all WIN markets
-        if novice_only:
-            return novice_only
-        else:
-            print("[BETFAIR] No novice hurdles today – falling back to all WIN markets.")
+        # First choice: Novice hurdles today
+        if novice_today:
+            return novice_today
+
+        # Second choice: all today's WIN markets
+        if all_today:
+            print("[BETFAIR] No novice hurdles today – using all WIN markets for today.")
             return all_today
+
+        # Last resort: if somehow nothing matches "today", return everything
+        print("[BETFAIR] No markets matched today's date – returning all WIN markets.")
+        return all_any
 
     def get_market_name(self, market_id: str) -> str:
         """
