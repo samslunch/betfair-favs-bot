@@ -922,13 +922,11 @@ async def inspect_event_types(request: Request):
 
     html_parts = []
     html_parts.append("<html><head><title>Inspect Event Types</title></head><body>")
-    html_parts.append("<h2>Betfair Event Types (what your account can see)</h2>")
-    html_parts.append("<p><a href='/'>⬅ Back to dashboard</a></p>")
+    html_parts.append("<h2>Betfair Event Types</h2>")
+    html_parts.append("<p><a href='/'>Back to dashboard</a></p>")
 
     if client.use_dummy:
-        html_parts.append(
-            "<p style='color:orange;'>Client is in DUMMY mode – switch to live to see real data.</p>"
-        )
+        html_parts.append("<p style='color:orange;'>Client is in DUMMY mode - switch to live mode to see real data.</p>")
         html_parts.append("</body></html>")
         return HTMLResponse("".join(html_parts))
 
@@ -941,34 +939,31 @@ async def inspect_event_types(request: Request):
         html_parts.append("</body></html>")
         return HTMLResponse("".join(html_parts))
 
-    html_parts.append(f"<p>Betfair returned <strong>{len(result)}</strong> event types.</p>")
-    html_parts.append(
-        """
-        <table border="1" cellspacing="0" cellpadding="4" style="font-size:0.8rem;border-color:#1f2937;">
-            <tr style="background:#111827;color:#e5e7eb;">
+    html_parts.append(f"<p>Betfair returned {len(result)} event types.</p>")
+    html_parts.append("""
+        <table border="1" cellspacing="0" cellpadding="4" style="font-size:0.8rem;">
+            <tr>
                 <th>#</th>
                 <th>EventTypeId</th>
                 <th>Name</th>
                 <th>MarketCount</th>
             </tr>
-        """
-    )
+    """)
 
     for idx, item in enumerate(result, 1):
         et = item.get("eventType", {}) or {}
         et_id = et.get("id", "?")
         et_name = et.get("name", "?")
         market_count = item.get("marketCount", 0)
-        html_parts.append(
-            f"""
+
+        html_parts.append(f"""
             <tr>
                 <td>{idx}</td>
                 <td>{et_id}</td>
                 <td>{et_name}</td>
                 <td>{market_count}</td>
             </tr>
-            """
-        )
+        """)
 
     html_parts.append("</table></body></html>")
     return HTMLResponse("".join(html_parts))
