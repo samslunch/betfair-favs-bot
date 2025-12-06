@@ -12,6 +12,7 @@
 # - Betfair "available to bet" balance display
 # - Mobile-friendly layout (no horizontal scroll)
 # - 1 minute before off: auto-timing (SIMULATED – logs only, no placeOrders)
+# - Recent results / history panel (last 10 races)
 
 import threading
 import time
@@ -358,7 +359,7 @@ def render_dashboard(message: str = "") -> HTMLResponse:
     bank_start = state.starting_bank
     bank_now = state.current_bank
     pl_today = state.todays_pl
-    races = state.races_played
+    races = state.races_played  # currently unused in UI, but kept
     pl_color = "#22c55e" if pl_today >= 0 else "#ef4444"
 
     # Betfair balance
@@ -459,6 +460,64 @@ def render_dashboard(message: str = "") -> HTMLResponse:
           </table>
         </div>
         {profit_line}
+        """
+
+    # Recent history (last 10)
+    recent_history = list(getattr(state, "history", []))[-10:][::-1]  # newest first
+    if recent_history:
+        history_rows = ""
+        for h in recent_history:
+            timestamp = h.get("timestamp", "")
+            # Make timestamp a bit friendlier
+            ts_disp = (
+                timestamp.replace("T", " ").replace("Z", "")
+                if isinstance(timestamp, str)
+                else str(timestamp)
+            )
+            mname = h.get("market_name", h.get("market_id", ""))
+            pnl = float(h.get("pnl", 0.0))
+            bank_after = float(h.get("bank_after", 0.0))
+            pnl_color = "#22c55e" if pnl >= 0 else "#ef4444"
+            pnl_str = f"£{pnl:.2f}"
+            bank_str = f"£{bank_after:.2f}"
+
+            history_rows += f"""
+              <tr>
+                <td class="hist-time">{ts_disp}</td>
+                <td class="hist-race">{mname}</td>
+                <td class="hist-pl" style="color:{pnl_color};">{pnl_str}</td>
+                <td class="hist-bank">{bank_str}</td>
+              </tr>
+            """
+
+        history_html = f"""
+        <div class="section-header">
+          <h2>Recent results</h2>
+          <span class="chip chip-soft">Last {len(recent_history)} races</span>
+        </div>
+        <div class="table-wrapper">
+          <table class="history-table">
+            <thead>
+              <tr>
+                <th>Time (UTC)</th>
+                <th>Race</th>
+                <th>P/L</th>
+                <th>Bank after</th>
+              </tr>
+            </thead>
+            <tbody>
+              {history_rows}
+            </tbody>
+          </table>
+        </div>
+        """
+    else:
+        history_html = """
+        <div class="section-header">
+          <h2>Recent results</h2>
+          <span class="chip chip-soft">No races yet</span>
+        </div>
+        <p class="muted">No results yet. Mark races as WON or LOST to build history.</p>
         """
 
     mode_label = "live" if not client.use_dummy else "dummy"
@@ -721,28 +780,35 @@ def render_dashboard(message: str = "") -> HTMLResponse:
             overflow: hidden;
             background: rgba(15, 23, 42, 0.9);
           }}
-          .ladder-table {{
+          .ladder-table,
+          .history-table {{
             width: 100%;
             border-collapse: collapse;
             font-size: 13px;
           }}
-          .ladder-table thead {{
+          .ladder-table thead,
+          .history-table thead {{
             background: rgba(15, 23, 42, 0.95);
           }}
           .ladder-table th,
-          .ladder-table td {{
+          .ladder-table td,
+          .history-table th,
+          .history-table td {{
             padding: 6px 8px;
             text-align: left;
           }}
-          .ladder-table th {{
+          .ladder-table th,
+          .history-table th {{
             font-weight: 500;
             color: var(--text-muted);
             border-bottom: 1px solid var(--border-subtle);
           }}
-          .ladder-table tbody tr:nth-child(even) {{
+          .ladder-table tbody tr:nth-child(even),
+          .history-table tbody tr:nth-child(even) {{
             background: rgba(15, 23, 42, 0.9);
           }}
-          .ladder-table tbody tr:nth-child(odd) {{
+          .ladder-table tbody tr:nth-child(odd),
+          .history-table tbody tr:nth-child(odd) {{
             background: rgba(15, 23, 42, 0.8);
           }}
           .runner-name {{
@@ -756,6 +822,18 @@ def render_dashboard(message: str = "") -> HTMLResponse:
             text-align: center;
             font-variant-numeric: tabular-nums;
             color: var(--accent);
+          }}
+          .hist-time {{
+            font-size: 12px;
+            color: var(--text-muted);
+          }}
+          .hist-race {{
+            font-size: 13px;
+          }}
+          .hist-pl,
+          .hist-bank {{
+            font-variant-numeric: tabular-nums;
+            text-align: right;
           }}
           .ladder-note {{
             margin-top: 8px;
@@ -1022,6 +1100,10 @@ def render_dashboard(message: str = "") -> HTMLResponse:
                   </div>
                 </div>
               </form>
+            </div>
+
+            <div class="panel" style="margin-top: 18px;">
+              {history_html}
             </div>
 
             <p class="footer-note">
