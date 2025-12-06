@@ -1,28 +1,23 @@
 # webapp.py
 #
-# FastAPI web UI for the Betfair bot.
-# - Secure login (session-based)
-# - Dashboard with:
-#     * Bank & staking controls
-#     * Quick profiles (2%, 5%, 10%, 15%, 20%)
-#     * Live Betfair balance
-#     * Race selection (today's horse markets via BetfairClient)
-#     * Bot control: Start / Stop / Race Won / Race Lost
-#     * Simple P/L history panel
+# FastAPI dashboard for the Betfair 2-fav dutching bot.
 #
-# Assumes:
-#   - betfair_client.py defines BetfairClient
-#   - strategy.py defines StrategyState and BotRunner
+# Features:
+#   - Login (session based)
+#   - Settings: bank, target, stake %, odds range, timing, quick profiles
+#   - Live Betfair balance (read-only)
+#   - Race selection: today's horse markets from BetfairClient
+#   - Bot control: Start / Stop / Race WON / Race LOST
+#   - Simple recent P/L history
 #
-# Env vars:
-#   SESSION_SECRET            -> session key (required in production)
-#   ADMIN_USERNAME            -> login username (defaults: "adamhill")
-#   ADMIN_PASSWORD            -> login password (defaults: "Adamhillonline1!")
-#   BETFAIR_DUMMY             -> "true"/"false" to use dummy mode
-#   BETFAIR_APP_KEY, BETFAIR_USERNAME, BETFAIR_PASSWORD for live mode
+# Depends on:
+#   betfair_client.py  (BetfairClient)
+#   strategy.py        (StrategyState, BotRunner)
+#
+# Run locally:
+#   uvicorn webapp:app --host 0.0.0.0 --port 8000 --reload
 
 import os
-import asyncio
 from typing import Optional
 
 from fastapi import FastAPI, Request, Form
@@ -47,7 +42,7 @@ ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "Adamhillonline1!")
 USE_DUMMY = os.getenv("BETFAIR_DUMMY", "false").lower() == "true"
 
 # --------------------------------------------------------
-# Global client, strategy state, bot runner
+# Global client, strategy state, runner
 # --------------------------------------------------------
 
 client = BetfairClient(use_dummy=USE_DUMMY)
@@ -70,7 +65,7 @@ def require_login(request: Request) -> Optional[RedirectResponse]:
 
 
 # --------------------------------------------------------
-# HTML rendering helpers
+# HTML: Login page
 # --------------------------------------------------------
 
 def render_login_page(error: str = "") -> HTMLResponse:
@@ -82,57 +77,59 @@ def render_login_page(error: str = "") -> HTMLResponse:
         <style>
             body {{
                 font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-                background: #0b1220;
+                background: #020617;
                 color: #e5e7eb;
                 margin: 0;
                 padding: 0;
             }}
             .container {{
-                max-width: 400px;
+                max-width: 380px;
                 margin: 80px auto;
                 padding: 24px;
                 background: #020617;
-                border-radius: 12px;
-                box-shadow: 0 20px 25px -5px rgba(0,0,0,0.5);
+                border-radius: 16px;
                 border: 1px solid #1f2937;
+                box-shadow: 0 20px 25px -5px rgba(0,0,0,0.5);
             }}
             h1 {{
                 margin-top: 0;
-                font-size: 1.6rem;
                 text-align: center;
+                font-size: 1.5rem;
             }}
             label {{
                 display: block;
+                font-size: 0.85rem;
                 margin-bottom: 4px;
-                font-size: 0.9rem;
                 color: #9ca3af;
             }}
             input[type="text"], input[type="password"] {{
                 width: 100%;
-                padding: 10px;
-                margin-bottom: 12px;
+                padding: 8px 10px;
+                margin-bottom: 10px;
                 border-radius: 8px;
                 border: 1px solid #374151;
                 background: #020617;
                 color: #e5e7eb;
+                font-size: 0.9rem;
             }}
             button {{
                 width: 100%;
-                padding: 10px;
+                padding: 9px;
                 border-radius: 999px;
                 border: none;
+                cursor: pointer;
                 background: linear-gradient(135deg, #22c55e, #16a34a);
                 color: white;
                 font-weight: 600;
-                cursor: pointer;
+                font-size: 0.95rem;
             }}
             button:hover {{
                 opacity: 0.9;
             }}
             .error {{
                 color: #f97316;
-                margin-bottom: 10px;
-                font-size: 0.9rem;
+                font-size: 0.85rem;
+                margin-bottom: 8px;
                 text-align: center;
             }}
         </style>
@@ -157,8 +154,12 @@ def render_login_page(error: str = "") -> HTMLResponse:
     return HTMLResponse(html)
 
 
+# --------------------------------------------------------
+# HTML: Dashboard
+# --------------------------------------------------------
+
 def render_dashboard(message: str = "") -> HTMLResponse:
-    # Fetch Betfair funds (safe)
+    # Betfair account funds
     try:
         funds = client.get_account_funds()
         bf_balance = funds.get("available_to_bet")
@@ -166,32 +167,32 @@ def render_dashboard(message: str = "") -> HTMLResponse:
         print("[WEBAPP] Error fetching account funds:", e)
         bf_balance = None
 
-    # Fetch markets for today (relaxed)
+    # Markets for today
     try:
         markets = client.get_todays_novice_hurdle_markets()
     except Exception as e:
         print("[WEBAPP] Error fetching markets:", e)
         markets = []
 
-    # Recent history view
+    # Recent history
     recent_history = []
     if hasattr(state, "history") and state.history:
-        # Assuming state.history is a list of dicts
         recent_history = list(state.history)[-10:][::-1]  # newest first
 
-    # Whether bot is running
     running = getattr(state, "running", False)
+    bank = getattr(state, "bank", 100.0)
+    starting_bank = getattr(state, "starting_bank", bank)
+    day_pl = bank - starting_bank
 
-    # HTML
+    selected_ids = set(getattr(state, "selected_markets", []))
+
     html = f"""
     <html>
     <head>
         <title>Betfair 2-Fav Dutching Bot</title>
         <meta name="viewport" content="width=device-width, initial-scale=1" />
         <style>
-            * {{
-                box-sizing: border-box;
-            }}
+            * {{ box-sizing: border-box; }}
             body {{
                 margin: 0;
                 font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
@@ -202,52 +203,55 @@ def render_dashboard(message: str = "") -> HTMLResponse:
                 color: #38bdf8;
                 text-decoration: none;
             }}
-            a:hover {{
-                text-decoration: underline;
-            }}
+            a:hover {{ text-decoration: underline; }}
             .page {{
                 max-width: 1200px;
                 margin: 0 auto;
-                padding: 16px;
+                padding: 14px;
             }}
             .top-bar {{
                 display: flex;
                 justify-content: space-between;
                 align-items: center;
-                margin-bottom: 16px;
                 gap: 8px;
+                margin-bottom: 12px;
             }}
-            .top-bar h1 {{
-                font-size: 1.4rem;
+            @media (max-width: 700px) {{
+                .top-bar {{
+                    flex-direction: column;
+                    align-items: flex-start;
+                }}
+            }}
+            h1 {{
                 margin: 0;
+                font-size: 1.4rem;
+            }}
+            .sub {{
+                font-size: 0.8rem;
+                color: #9ca3af;
             }}
             .pill {{
                 border-radius: 999px;
-                padding: 4px 10px;
+                padding: 3px 8px;
                 font-size: 0.75rem;
                 display: inline-flex;
                 align-items: center;
                 gap: 4px;
             }}
             .pill.green {{
-                background: rgba(34,197,94,0.12);
-                color: #4ade80;
+                background: rgba(34,197,94,0.1);
                 border: 1px solid rgba(34,197,94,0.3);
+                color: #4ade80;
             }}
             .pill.red {{
-                background: rgba(248,113,113,0.12);
-                color: #fca5a5;
+                background: rgba(248,113,113,0.1);
                 border: 1px solid rgba(248,113,113,0.3);
-            }}
-            .pill.blue {{
-                background: rgba(59,130,246,0.12);
-                color: #93c5fd;
-                border: 1px solid rgba(59,130,246,0.3);
+                color: #fca5a5;
             }}
             .grid {{
                 display: grid;
                 grid-template-columns: 1.1fr 1fr;
-                gap: 16px;
+                gap: 14px;
             }}
             @media (max-width: 900px) {{
                 .grid {{
@@ -257,8 +261,8 @@ def render_dashboard(message: str = "") -> HTMLResponse:
             .card {{
                 background: #020617;
                 border-radius: 16px;
-                padding: 14px 16px;
                 border: 1px solid #1f2937;
+                padding: 12px 14px;
                 box-shadow: 0 20px 25px -5px rgba(0,0,0,0.4);
             }}
             .card h2 {{
@@ -266,19 +270,14 @@ def render_dashboard(message: str = "") -> HTMLResponse:
                 font-size: 1rem;
             }}
             .card h3 {{
-                margin: 6px 0 6px 0;
+                margin: 8px 0 6px 0;
                 font-size: 0.95rem;
-                color: #e5e7eb;
-            }}
-            .sub {{
-                font-size: 0.8rem;
-                color: #9ca3af;
             }}
             label {{
-                font-size: 0.8rem;
-                color: #9ca3af;
                 display: block;
+                font-size: 0.8rem;
                 margin-bottom: 3px;
+                color: #9ca3af;
             }}
             input[type="number"], input[type="text"] {{
                 width: 100%;
@@ -296,14 +295,14 @@ def render_dashboard(message: str = "") -> HTMLResponse:
             }}
             .row > div {{
                 flex: 1;
-                min-width: 120px;
+                min-width: 130px;
             }}
             .btn {{
                 border-radius: 999px;
                 padding: 6px 12px;
                 border: none;
                 cursor: pointer;
-                font-size: 0.85rem;
+                font-size: 0.8rem;
                 font-weight: 600;
                 display: inline-flex;
                 align-items: center;
@@ -326,22 +325,13 @@ def render_dashboard(message: str = "") -> HTMLResponse:
                 padding: 4px 10px;
                 font-size: 0.75rem;
             }}
-            .btn + .btn {{
-                margin-left: 6px;
-            }}
-            .badge {{
-                font-size: 0.75rem;
-                padding: 2px 8px;
-                border-radius: 999px;
-                background: #0f172a;
-                border: 1px solid #374151;
-                color: #9ca3af;
-            }}
             .message {{
-                margin-bottom: 8px;
-                font-size: 0.85rem;
+                font-size: 0.8rem;
                 color: #f97316;
+                margin-bottom: 6px;
             }}
+            .green-text {{ color: #4ade80; }}
+            .red-text {{ color: #fca5a5; }}
             .history-table {{
                 width: 100%;
                 border-collapse: collapse;
@@ -354,16 +344,9 @@ def render_dashboard(message: str = "") -> HTMLResponse:
             .history-table th {{
                 text-align: left;
                 color: #9ca3af;
-                font-weight: 500;
             }}
             .history-table tr:last-child td {{
                 border-bottom: none;
-            }}
-            .green-text {{
-                color: #4ade80;
-            }}
-            .red-text {{
-                color: #fca5a5;
             }}
         </style>
     </head>
@@ -383,7 +366,7 @@ def render_dashboard(message: str = "") -> HTMLResponse:
                         {"Running" if running else "Stopped"}
                     </div><br/>
                     <span class="sub">
-                        Mode: {"DUMMY" if USE_DUMMY else "LIVE READ-ONLY (no placeOrders yet)"}
+                        Mode: {"DUMMY" if USE_DUMMY else "LIVE READ-ONLY (no bets placed)"}
                     </span>
                 </div>
             </div>
@@ -391,7 +374,7 @@ def render_dashboard(message: str = "") -> HTMLResponse:
             {"<div class='message'>" + message + "</div>" if message else ""}
 
             <div class="grid">
-                <!-- LEFT COLUMN: SETTINGS + RACES -->
+                <!-- LEFT: settings + races -->
                 <div class="card">
                     <h2>Bank, Staking & Races</h2>
 
@@ -400,25 +383,25 @@ def render_dashboard(message: str = "") -> HTMLResponse:
                             <div>
                                 <label for="starting_bank">Starting bank (£)</label>
                                 <input type="number" step="0.01" name="starting_bank" id="starting_bank"
-                                    value="{getattr(state, 'starting_bank', 100.0)}" />
+                                       value="{getattr(state, 'starting_bank', 100.0)}" />
                             </div>
                             <div>
                                 <label for="current_bank">Current bank (£)</label>
                                 <input type="number" step="0.01" name="current_bank" id="current_bank"
-                                    value="{getattr(state, 'bank', 100.0)}" />
+                                       value="{getattr(state, 'bank', 100.0)}" />
                             </div>
                         </div>
 
                         <div class="row" style="margin-top:8px;">
                             <div>
-                                <label for="target_profit">Target profit for the day (£)</label>
+                                <label for="target_profit">Target profit for day (£)</label>
                                 <input type="number" step="0.01" name="target_profit" id="target_profit"
-                                    value="{getattr(state, 'target_profit', 5.0)}" />
+                                       value="{getattr(state, 'target_profit', 5.0)}" />
                             </div>
                             <div>
                                 <label for="stake_percent">Stake % of bank per race</label>
                                 <input type="number" step="0.1" name="stake_percent" id="stake_percent"
-                                    value="{getattr(state, 'stake_percent', 5.0)}" />
+                                       value="{getattr(state, 'stake_percent', 5.0)}" />
                             </div>
                         </div>
 
@@ -426,12 +409,12 @@ def render_dashboard(message: str = "") -> HTMLResponse:
                             <div>
                                 <label for="min_odds">Min odds (fav)</label>
                                 <input type="number" step="0.01" name="min_odds" id="min_odds"
-                                    value="{getattr(state, 'min_odds', 1.5)}" />
+                                       value="{getattr(state, 'min_odds', 1.5)}" />
                             </div>
                             <div>
                                 <label for="max_odds">Max odds (fav)</label>
                                 <input type="number" step="0.01" name="max_odds" id="max_odds"
-                                    value="{getattr(state, 'max_odds', 4.5)}" />
+                                       value="{getattr(state, 'max_odds', 4.5)}" />
                             </div>
                         </div>
 
@@ -439,7 +422,7 @@ def render_dashboard(message: str = "") -> HTMLResponse:
                             <div>
                                 <label for="seconds_before_off">Place bets (seconds before off)</label>
                                 <input type="number" step="1" name="seconds_before_off" id="seconds_before_off"
-                                    value="{getattr(state, 'seconds_before_off', 60)}" />
+                                       value="{getattr(state, 'seconds_before_off', 60)}" />
                             </div>
                         </div>
 
@@ -463,52 +446,53 @@ def render_dashboard(message: str = "") -> HTMLResponse:
                     <hr style="border-color:#1f2937; margin:14px 0;" />
 
                     <h3>Available Races Today</h3>
-                    <div class="sub" style="margin-bottom:8px;">
-                        Pulled from Betfair (super-relaxed horse racing filter).
+                    <div class="sub" style="margin-bottom:6px;">
+                        From Betfair (horse racing, relaxed filter – novice hurdles preferred).
                     </div>
-                    {"<p style='color:#f97316;font-size:0.8rem;'>No markets returned by Betfair.</p>" if not markets else ""}
+    """
 
+    if not markets:
+        html += """
+                    <p style="color:#f97316;font-size:0.8rem;">
+                        No markets returned by Betfair. Check API / filters.
+                    </p>
+        """
+
+    html += """
                     <form method="POST" action="/update_race_selection">
-                        <div style="max-height:250px; overflow-y:auto; border-radius:8px; border:1px solid #1f2937; padding:8px;">
+                        <div style="max-height:260px; overflow-y:auto; border-radius:8px;
+                                    border:1px solid #1f2937; padding:8px;">
     """
 
     # Race checkboxes
-    selected_ids = set(getattr(state, "selected_markets", []))
-    if markets:
-        for m in markets:
-            mid = m["market_id"]
-            name = m["name"]
-            checked = "checked" if mid in selected_ids else ""
-            html += f"""
-                <label style="display:flex;align-items:center;gap:6px;font-size:0.8rem;padding:2px 0;">
-                    <input type="checkbox" name="selected_markets" value="{mid}" {checked} />
-                    <span>{name}</span>
-                </label>
-            """
+    for m in markets:
+        mid = m["market_id"]
+        name = m["name"]
+        checked = "checked" if mid in selected_ids else ""
+        html += f"""
+                            <label style="display:flex;align-items:center;gap:6px;font-size:0.8rem;padding:2px 0;">
+                                <input type="checkbox" name="selected_markets" value="{mid}" {checked} />
+                                <span>{name}</span>
+                            </label>
+        """
 
     html += """
                         </div>
                         <div style="margin-top:8px;">
-                            <button type="submit" class="btn btn-secondary btn-small">Save race selection</button>
+                            <button type="submit" class="btn btn-secondary btn-small">
+                                Save race selection
+                            </button>
                         </div>
                     </form>
                 </div>
 
-                <!-- RIGHT COLUMN: STATUS + CONTROL + HISTORY -->
+                <!-- RIGHT: status, controls, history -->
                 <div class="card">
                     <h2>Status & Controls</h2>
-    """
-
-    # Bank & P/L status
-    bank = getattr(state, "bank", 100.0)
-    start_bank = getattr(state, "starting_bank", bank)
-    day_pl = bank - start_bank
-
-    html += f"""
                     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
                         <div>
                             <div class="sub">Current bank</div>
-                            <div style="font-size:1.3rem;">£{bank:.2f}</div>
+                            <div style="font-size:1.2rem;">£{bank:.2f}</div>
                         </div>
                         <div>
                             <div class="sub">Day P/L</div>
@@ -525,19 +509,14 @@ def render_dashboard(message: str = "") -> HTMLResponse:
                     </div>
 
                     <form method="POST" action="/start">
-                        <button type="submit" class="btn btn-primary">
-                            ▶ Start Bot
-                        </button>
+                        <button type="submit" class="btn btn-primary">▶ Start Bot</button>
                     </form>
-
                     <form method="POST" action="/stop" style="margin-top:6px;">
-                        <button type="submit" class="btn btn-danger">
-                            ■ Stop Bot
-                        </button>
+                        <button type="submit" class="btn btn-danger">■ Stop Bot</button>
                     </form>
 
                     <div style="margin-top:12px;">
-                        <span class="sub">Manual race outcome control (still required while no auto-result):</span><br/>
+                        <span class="sub">Manual race outcome (until auto-result is wired in):</span><br/>
                         <form method="POST" action="/race_won" style="display:inline;">
                             <button type="submit" class="btn btn-secondary btn-small">Race WON</button>
                         </form>
@@ -554,7 +533,7 @@ def render_dashboard(message: str = "") -> HTMLResponse:
                             <th>#</th>
                             <th>Race</th>
                             <th>Favourites</th>
-                            <th>Stakes</th>
+                            <th>Stake</th>
                             <th>P/L</th>
                         </tr>
     """
@@ -562,17 +541,17 @@ def render_dashboard(message: str = "") -> HTMLResponse:
     if recent_history:
         for idx, row in enumerate(recent_history, 1):
             race_name = row.get("race_name", "?")
-            favs = row.get("favs", "")
+            favs = row.get("favs", "Top 2 favourites")
             stake = row.get("total_stake", 0.0)
             pl = row.get("pl", 0.0)
-            pl_class = "green-text" if pl >= 0 else "red-text"
+            cls = "green-text" if pl >= 0 else "red-text"
             html += f"""
                         <tr>
                             <td>{idx}</td>
                             <td>{race_name}</td>
                             <td>{favs}</td>
                             <td>£{stake:.2f}</td>
-                            <td class="{pl_class}">£{pl:.2f}</td>
+                            <td class="{cls}">£{pl:.2f}</td>
                         </tr>
             """
     else:
@@ -595,7 +574,7 @@ def render_dashboard(message: str = "") -> HTMLResponse:
 
 
 # --------------------------------------------------------
-# Routes
+# Routes: auth
 # --------------------------------------------------------
 
 @app.get("/login")
@@ -624,6 +603,10 @@ async def logout(request: Request):
     return RedirectResponse("/login", status_code=303)
 
 
+# --------------------------------------------------------
+# Routes: main dashboard
+# --------------------------------------------------------
+
 @app.get("/", response_class=HTMLResponse)
 async def root(request: Request):
     redirect = require_login(request)
@@ -632,7 +615,9 @@ async def root(request: Request):
     return render_dashboard()
 
 
-# ---------------- SETTINGS + RACE SELECTION ----------------
+# --------------------------------------------------------
+# Routes: settings & race selection
+# --------------------------------------------------------
 
 @app.post("/update_settings")
 async def update_settings(
@@ -651,7 +636,6 @@ async def update_settings(
     if redirect:
         return redirect
 
-    # Update base settings
     state.starting_bank = starting_bank
 
     if reset_bank:
@@ -682,12 +666,15 @@ async def update_race_selection(request: Request):
     form = await request.form()
     selected = form.getlist("selected_markets")
     state.selected_markets = selected
+    state.current_index = 0  # reset sequence when user changes selection
     print("[WEBAPP] User selected markets:", selected)
 
     return render_dashboard("Race selection updated.")
 
 
-# ---------------- BOT CONTROL ----------------
+# --------------------------------------------------------
+# Routes: bot control
+# --------------------------------------------------------
 
 @app.post("/start")
 async def start_bot(request: Request):
@@ -695,12 +682,10 @@ async def start_bot(request: Request):
     if redirect:
         return redirect
 
-    if not getattr(state, "selected_markets", []):
-        return render_dashboard("No races selected – select at least one race before starting.")
+    if not state.selected_markets:
+        return render_dashboard("No races selected – tick at least one race and save.")
 
-    # Start the bot runner (non-blocking)
     try:
-        # BotRunner is assumed to manage its own background task/thread.
         runner.start()
     except Exception as e:
         print("[WEBAPP] Error starting bot:", e)
@@ -730,12 +715,11 @@ async def race_won(request: Request):
     if redirect:
         return redirect
 
-    # Strategy/BotRunner should interpret this appropriately.
     try:
         runner.mark_race_won()
     except Exception as e:
         print("[WEBAPP] Error marking race as won:", e)
-        return render_dashboard(f"Error marking race as won: {e}")
+        return render_dashboard(f"Error marking race as WON: {e}")
 
     return render_dashboard("Race marked as WON.")
 
@@ -750,15 +734,16 @@ async def race_lost(request: Request):
         runner.mark_race_lost()
     except Exception as e:
         print("[WEBAPP] Error marking race as lost:", e)
-        return render_dashboard(f"Error marking race as lost: {e}")
+        return render_dashboard(f"Error marking race as LOST: {e}")
 
     return render_dashboard("Race marked as LOST.")
 
 
 # --------------------------------------------------------
-# Local dev entrypoint (optional)
+# Local dev entrypoint
 # --------------------------------------------------------
 
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run("webapp:app", host="0.0.0.0", port=8000, reload=True)
