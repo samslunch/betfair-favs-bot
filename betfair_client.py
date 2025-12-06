@@ -26,6 +26,7 @@ IDENTITY_ENDPOINT = "https://identitysso.betfair.com/api/login"
 
 class BetfairClient:
     def __init__(self, use_dummy: bool = True):
+        print("[BETFAIR] Client version: 2025-12-06-FALLBACK")
         """
         use_dummy=True  -> no real API calls, returns fake data
         use_dummy=False -> real Betfair API-NG (needs env vars)
