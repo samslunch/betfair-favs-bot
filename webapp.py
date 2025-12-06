@@ -853,6 +853,65 @@ async def inspect_hurdles(request: Request):
 
 
 # --------------------------------------------------------
+# Debug route: inspect available event types from Betfair
+# --------------------------------------------------------
+
+@app.get("/inspect_event_types", response_class=HTMLResponse)
+async def inspect_event_types(request: Request):
+    redirect = require_login(request)
+    if redirect:
+        return redirect
+
+    html_parts = []
+    html_parts.append("<html><head><title>Inspect Event Types</title></head><body>")
+    html_parts.append("<h2>Betfair Event Types (what your account can see)</h2>")
+    html_parts.append("<p><a href='/'>⬅ Back to dashboard</a></p>")
+
+    if client.use_dummy:
+        html_parts.append("<p style='color:orange;'>Client is in DUMMY mode – switch to live to see real data.</p>")
+        html_parts.append("</body></html>")
+        return HTMLResponse(\"\".join(html_parts))
+
+    params = {"filter": {}}
+
+    try:
+        result = client._rpc("listEventTypes", params)
+    except Exception as e:
+        html_parts.append(f"<p style='color:red;'>Error calling listEventTypes: {e}</p>")
+        html_parts.append("</body></html>")
+        return HTMLResponse(\"\".join(html_parts))
+
+    html_parts.append(f"<p>Betfair returned <strong>{len(result)}</strong> event types.</p>")
+    html_parts.append(\"\"\"
+        <table border="1" cellspacing="0" cellpadding="4" style="font-size:0.8rem;border-color:#1f2937;">
+            <tr style="background:#111827;color:#e5e7eb;">
+                <th>#</th>
+                <th>EventTypeId</th>
+                <th>Name</th>
+                <th>MarketCount</th>
+            </tr>
+    \"\"\")
+
+    for idx, item in enumerate(result, 1):
+        et = item.get("eventType", {}) or {}
+        et_id = et.get("id", "?")
+        et_name = et.get("name", "?")
+        market_count = item.get("marketCount", 0)
+        html_parts.append(f\"\"\"
+            <tr>
+                <td>{idx}</td>
+                <td>{et_id}</td>
+                <td>{et_name}</td>
+                <td>{market_count}</td>
+            </tr>
+        \"\"\")
+
+    html_parts.append("</table></body></html>")
+    return HTMLResponse(\"\".join(html_parts))
+
+
+
+# --------------------------------------------------------
 # Local dev entrypoint
 # --------------------------------------------------------
 
