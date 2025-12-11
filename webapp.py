@@ -1,865 +1,1246 @@
 # webapp.py
 #
-# FastAPI dashboard for the Betfair 2-fav dutching bot.
-#
-# Features:
-#   - Login (session based)
-#   - Settings: bank, target, stake %, odds range, timing, quick profiles
-#   - Live Betfair balance (read-only)
-#   - Race selection: today's horse markets from BetfairClient
-#   - Bot control: Start / Stop / Race WON / Race LOST
-#   - Simple recent P/L history
-#   - Debug route: /inspect_hurdles to inspect today's horse markets names
-#
-# Depends on:
-#   betfair_client.py  (BetfairClient)
-#   strategy.py        (StrategyState, BotRunner)
-#
-# Run locally:
-#   uvicorn webapp:app --host 0.0.0.0 --port 8000 --reload
+# FastAPI dashboard that uses:
+# - betfair_client.BetfairClient for race & price data (dummy or live)
+# - strategy.ProgressionStrategy for staking / progression + bank/P&L
+# Includes:
+# - Simple login page (username/password)
+# - Session cookie to protect all routes
+# - Logout button
+# - Reset bank + % profiles (2, 5, 10, 15, 20)
+# - Live/dummy indicator for Betfair
+# - Betfair "available to bet" balance display
+# - Mobile-friendly layout (no horizontal scroll)
+# - 1 minute before off: auto-timing (SIMULATED – logs only, no placeOrders)
+# - Recent results / history panel (last 10 races)
 
-import os
-import datetime as dt
-from typing import Optional
+import threading
+import time
+from typing import List
+from datetime import datetime, timezone
 
 from fastapi import FastAPI, Request, Form
 from fastapi.responses import HTMLResponse, RedirectResponse
 from starlette.middleware.sessions import SessionMiddleware
 
 from betfair_client import BetfairClient
-from strategy import StrategyState, BotRunner
+from strategy import StrategyState, ProgressionStrategy
 
 
-# --------------------------------------------------------
-# App & middleware
-# --------------------------------------------------------
+# ======================
+# Auth config
+# ======================
+
+ADMIN_USERNAME = "adamhill"
+ADMIN_PASSWORD = "Adamhillonline1!"
+SECRET_KEY = "super-secret-local-key-change-me-later"
+
+
+# ======================
+# Setup: client + strategy + background loop
+# ======================
+
+# Set use_dummy=True if you want to test without live Betfair.
+client = BetfairClient(use_dummy=False)
+state = StrategyState()
+strategy = ProgressionStrategy(state)
+
+
+class BotRunner:
+    """
+    Background bot loop.
+    - Watches the current market's start time.
+    - When 0 < seconds_to_off <= 60 and no bet placed yet,
+      it computes dutch stakes and LOGS what it would do.
+    - Still NO REAL BETS are placed.
+    """
+
+    def __init__(self, strategy: ProgressionStrategy, client: BetfairClient):
+        self.strategy = strategy
+        self.client = client
+        self.running = False
+
+    def start_day(self):
+        print("[BOT] Start day requested")
+        self.strategy.start_day(self.client.get_market_name)
+        self.running = True
+
+    def stop(self):
+        print("[BOT] Stop requested")
+        self.running = False
+
+    def on_race_won_manual(self):
+        if not state.current_market_id:
+            print("[BOT] Race WON pressed but no current market.")
+            return
+        pnl = max(state.last_total_stake, 0.0)
+        self.strategy.on_market_won(pnl=pnl)
+        state.bet_placed_for_current = False
+        state.current_market_start = None
+        self.running = False
+
+    def on_race_lost_manual(self):
+        if not state.current_market_id:
+            print("[BOT] Race LOST pressed but no current market.")
+            return
+
+        pnl = -abs(state.last_total_stake)
+        self.strategy.on_market_lost(pnl=pnl)
+
+        if self.strategy.has_more_markets() and not state.day_done:
+            state.current_index += 1
+            self.strategy.update_current_market(self.client.get_market_name)
+        else:
+            print("[BOT] No more markets or day done.")
+            self.running = False
+
+    def loop(self):
+        print("[BOT] Loop started (auto-timing simulated bets; no real orders).")
+        while True:
+            try:
+                if self.running and not state.day_done and state.current_market_id:
+                    # Make sure we have the market start time
+                    if state.current_market_start is None:
+                        try:
+                            state.current_market_start = self.client.get_market_start_time(
+                                state.current_market_id
+                            )
+                            print(
+                                f"[BOT] Start time for {state.current_market_name}: "
+                                f"{state.current_market_start}"
+                            )
+                        except Exception as e:
+                            print("[BOT] Error getting market start time:", e)
+                            time.sleep(10)
+                            continue
+
+                    now = datetime.now(timezone.utc)
+                    secs_to_off = (state.current_market_start - now).total_seconds()
+
+                    # 1-minute-before-off window
+                    if 0 < secs_to_off <= 60 and not state.bet_placed_for_current:
+                        favs = self.client.get_top_two_favourites(state.current_market_id)
+                        if len(favs) == 2:
+                            o1 = favs[0]["back"]
+                            o2 = favs[1]["back"]
+                            s1, s2, total, profit = self.strategy.compute_dutch_for_current(
+                                o1, o2
+                            )
+                            if total > 0:
+                                print(
+                                    "[BOT] [SIMULATED] 1 minute before off.\n"
+                                    f"  Market: {state.current_market_name}\n"
+                                    f"  Favs: {favs[0]['name']} @ {o1}, "
+                                    f"{favs[1]['name']} @ {o2}\n"
+                                    f"  Stakes: s1={s1:.2f}, s2={s2:.2f}, total={total:.2f}\n"
+                                    f"  Expected profit if either wins: {profit:.2f}\n"
+                                    "  (No real placeOrders sent yet.)"
+                                )
+                                state.bet_placed_for_current = True
+                            else:
+                                print("[BOT] Computed zero total stake, skipping simulated bet.")
+                        else:
+                            print("[BOT] Could not find 2 favourites to dutch for current market.")
+
+                time.sleep(5)
+            except Exception as e:
+                print("[BOT] Error in loop:", e)
+                time.sleep(5)
+
+
+bot = BotRunner(strategy, client)
+thread = threading.Thread(target=bot.loop, daemon=True)
+thread.start()
+
+
+# ======================
+# FastAPI app + session middleware
+# ======================
 
 app = FastAPI()
-
-SESSION_SECRET = os.getenv("SESSION_SECRET", "dev-secret-change-me")
-app.add_middleware(SessionMiddleware, secret_key=SESSION_SECRET)
-
-ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "adamhill")
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "Adamhillonline1!")
-
-# For VPS safety right now we force dummy mode on.
-# When you're ready for live, change to:
-#   USE_DUMMY = os.getenv("BETFAIR_DUMMY", "false").lower() == "true"
-USE_DUMMY = True
-
-# --------------------------------------------------------
-# Global client, strategy state, runner
-# --------------------------------------------------------
-
-client = BetfairClient(use_dummy=USE_DUMMY)
-state = StrategyState()
-runner = BotRunner(client=client, state=state)
+app.add_middleware(SessionMiddleware, secret_key=SECRET_KEY)
 
 
-# --------------------------------------------------------
-# Auth helpers
-# --------------------------------------------------------
+# ======================
+# Auth helpers & login page
+# ======================
 
-def is_logged_in(request: Request) -> bool:
-    return request.session.get("user") == "admin"
-
-
-def require_login(request: Request) -> Optional[RedirectResponse]:
-    if not is_logged_in(request):
-        return RedirectResponse("/login", status_code=303)
-    return None
+def is_authenticated(request: Request) -> bool:
+    return bool(request.session.get("authenticated"))
 
 
-# --------------------------------------------------------
-# HTML: Login page
-# --------------------------------------------------------
-
-def render_login_page(error: str = "") -> HTMLResponse:
+def render_login(message: str = "") -> HTMLResponse:
     html = f"""
     <html>
-    <head>
-        <title>Betfair Bot Login</title>
-        <meta name="viewport" content="width=device-width, initial-scale=1" />
+      <head>
+        <title>Betfair Bot – Login</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
         <style>
-            body {{
-                font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-                background: #020617;
-                color: #e5e7eb;
-                margin: 0;
-                padding: 0;
-            }}
-            .container {{
-                max-width: 380px;
-                margin: 80px auto;
-                padding: 24px;
-                background: #020617;
-                border-radius: 16px;
-                border: 1px solid #1f2937;
-                box-shadow: 0 20px 25px -5px rgba(0,0,0,0.5);
-            }}
-            h1 {{
-                margin-top: 0;
-                text-align: center;
-                font-size: 1.5rem;
-            }}
-            label {{
-                display: block;
-                font-size: 0.85rem;
-                margin-bottom: 4px;
-                color: #9ca3af;
-            }}
-            input[type="text"], input[type="password"] {{
-                width: 100%;
-                padding: 8px 10px;
-                margin-bottom: 10px;
-                border-radius: 8px;
-                border: 1px solid #374151;
-                background: #020617;
-                color: #e5e7eb;
-                font-size: 0.9rem;
-            }}
-            button {{
-                width: 100%;
-                padding: 9px;
-                border-radius: 999px;
-                border: none;
-                cursor: pointer;
-                background: linear-gradient(135deg, #22c55e, #16a34a);
-                color: white;
-                font-weight: 600;
-                font-size: 0.95rem;
-            }}
-            button:hover {{
-                opacity: 0.9;
-            }}
-            .error {{
-                color: #f97316;
-                font-size: 0.85rem;
-                margin-bottom: 8px;
-                text-align: center;
-            }}
+          :root {{
+            --bg: #020617;
+            --bg-elevated: rgba(15, 23, 42, 0.9);
+            --border-subtle: rgba(148, 163, 184, 0.2);
+            --accent: #22c55e;
+            --accent-strong: #16a34a;
+            --danger: #ef4444;
+            --text-main: #e5e7eb;
+            --text-muted: #9ca3af;
+          }}
+          * {{ box-sizing: border-box; }}
+          body {{
+            margin: 0;
+            padding: 0;
+            font-family: system-ui, -apple-system, BlinkMacSystemFont, "SF Pro Text",
+                         "Segoe UI", sans-serif;
+            color: var(--text-main);
+            background: radial-gradient(circle at top, #0f172a 0, #020617 55%, #000 100%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            overflow-x: hidden;
+          }}
+          .shell {{
+            width: 100%;
+            max-width: 380px;
+            padding: 16px;
+          }}
+          .card {{
+            background: var(--bg-elevated);
+            border-radius: 18px;
+            border: 1px solid var(--border-subtle);
+            box-shadow:
+              0 24px 60px rgba(15, 23, 42, 0.7),
+              0 0 0 1px rgba(15, 23, 42, 0.9);
+            padding: 22px 22px 24px;
+          }}
+          h1 {{
+            margin: 0 0 6px;
+            font-size: 20px;
+            letter-spacing: 0.04em;
+            text-transform: uppercase;
+          }}
+          .subtitle {{
+            margin: 0 0 16px;
+            font-size: 12px;
+            color: var(--text-muted);
+          }}
+          .field-label {{
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+            margin-bottom: 10px;
+            font-size: 12px;
+            color: var(--text-muted);
+          }}
+          .field-label span {{
+            font-size: 11px;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+          }}
+          .field-label input {{
+            border-radius: 999px;
+            border: 1px solid var(--border-subtle);
+            background: rgba(15, 23, 42, 0.9);
+            color: var(--text-main);
+            padding: 7px 11px;
+            font-size: 13px;
+            width: 100%;
+          }}
+          .field-label input:focus {{
+            outline: none;
+            border-color: var(--accent);
+            box-shadow: 0 0 0 1px rgba(34, 197, 94, 0.6);
+          }}
+          .btn {{
+            border: 0;
+            border-radius: 999px;
+            padding: 8px 14px;
+            font-size: 13px;
+            cursor: pointer;
+            font-weight: 500;
+            letter-spacing: 0.03em;
+            text-transform: uppercase;
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            transition: all 0.16s ease-out;
+          }}
+          .btn-primary {{
+            background: var(--accent);
+            color: #022c22;
+            width: 100%;
+            justify-content: center;
+          }}
+          .btn-primary:hover {{
+            background: var(--accent-strong);
+            transform: translateY(-1px);
+            box-shadow: 0 10px 20px rgba(34, 197, 94, 0.35);
+          }}
+          .message {{
+            margin-top: 8px;
+            padding: 6px 10px;
+            border-radius: 10px;
+            background: rgba(248, 113, 113, 0.1);
+            border: 1px solid rgba(248, 113, 113, 0.7);
+            font-size: 12px;
+            color: #fecaca;
+          }}
+          .hint {{
+            margin-top: 12px;
+            font-size: 11px;
+            color: var(--text-muted);
+            text-align: center;
+          }}
         </style>
-    </head>
-    <body>
-        <div class="container">
-            <h1>Betfair Bot Login</h1>
-            {"<div class='error'>" + error + "</div>" if error else ""}
-            <form method="POST" action="/login">
-                <label for="username">Username</label>
-                <input type="text" name="username" id="username" />
-
-                <label for="password">Password</label>
-                <input type="password" name="password" id="password" />
-
-                <button type="submit">Log In</button>
+      </head>
+      <body>
+        <div class="shell">
+          <div class="card">
+            <h1>Betfair Bot</h1>
+            <p class="subtitle">Secure login</p>
+            <form method="post" action="/login">
+              <label class="field-label">
+                <span>Username</span>
+                <input type="text" name="username" autocomplete="username" />
+              </label>
+              <label class="field-label">
+                <span>Password</span>
+                <input type="password" name="password" autocomplete="current-password" />
+              </label>
+              <button class="btn btn-primary" type="submit">Sign in</button>
             </form>
+            {"<div class='message'>" + message + "</div>" if message else ""}
+            <div class="hint">
+              Use your configured dashboard credentials.
+            </div>
+          </div>
         </div>
-    </body>
+      </body>
     </html>
     """
-    return HTMLResponse(html)
+    return HTMLResponse(content=html)
 
 
-# --------------------------------------------------------
-# HTML: Dashboard
-# --------------------------------------------------------
+@app.get("/login", response_class=HTMLResponse)
+async def login_get(request: Request):
+    if is_authenticated(request):
+        return RedirectResponse("/", status_code=303)
+    return render_login()
+
+
+@app.post("/login", response_class=HTMLResponse)
+async def login_post(request: Request, username: str = Form(...), password: str = Form(...)):
+    if username == ADMIN_USERNAME and password == ADMIN_PASSWORD:
+        request.session["authenticated"] = True
+        print("[AUTH] Login successful.")
+        return RedirectResponse("/", status_code=303)
+    print("[AUTH] Login failed.")
+    return render_login("Invalid username or password.")
+
+
+@app.post("/logout")
+async def logout(request: Request):
+    request.session.clear()
+    print("[AUTH] Logged out.")
+    return RedirectResponse("/login", status_code=303)
+
+
+# ======================
+# Dashboard renderer
+# ======================
 
 def render_dashboard(message: str = "") -> HTMLResponse:
-    # Betfair account funds
+    status = "RUNNING" if bot.running else "STOPPED"
+    status_color = "#22c55e" if bot.running else "#ef4444"
+    day_status = "DAY DONE" if state.day_done else "IN PROGRESS"
+    day_color = "#0ea5e9" if not state.day_done else "#eab308"
+
+    bank_start = state.starting_bank
+    bank_now = state.current_bank
+    pl_today = state.todays_pl
+    races = state.races_played  # currently unused in UI, but kept
+    pl_color = "#22c55e" if pl_today >= 0 else "#ef4444"
+
+    # Betfair balance
+    bf_balance = None
     try:
         funds = client.get_account_funds()
         bf_balance = funds.get("available_to_bet")
     except Exception as e:
-        print("[WEBAPP] Error fetching account funds:", e)
+        print("[BETFAIR] get_account_funds error:", e)
         bf_balance = None
 
-    # Markets for today
-    try:
-        markets = client.get_todays_novice_hurdle_markets()
-    except Exception as e:
-        print("[WEBAPP] Error fetching markets:", e)
-        markets = []
+    if bf_balance is not None:
+        bf_balance_display = f"£{bf_balance:.2f}"
+    else:
+        bf_balance_display = "N/A"
 
-    # Recent history
-    recent_history = []
-    if hasattr(state, "history") and state.history:
-        recent_history = list(state.history)[-10:][::-1]  # newest first
+    novice_markets = client.get_todays_novice_hurdle_markets()
+    selected_set = set(state.selected_market_ids)
 
-    running = getattr(state, "running", False)
-    bank = getattr(state, "bank", 100.0)
-    starting_bank = getattr(state, "starting_bank", bank)
-    day_pl = bank - starting_bank
+    race_list_html = ""
+    for m in novice_markets:
+        checked = "checked" if m["market_id"] in selected_set else ""
+        race_list_html += f"""
+          <label class="race-item">
+            <input type="checkbox" name="market_ids" value="{m['market_id']}" {checked}/>
+            <div class="race-card">
+              <div class="race-name">{m['name']}</div>
+              <div class="race-tag">Novice Hurdle</div>
+            </div>
+          </label>
+        """
 
-    selected_ids = set(getattr(state, "selected_markets", []))
+    if state.current_market_id and state.current_market_name:
+        current_info = (
+            f"Race {state.current_index + 1}/{len(state.selected_market_ids)} · "
+            f"{state.current_market_name}"
+        )
+    else:
+        current_info = "No current race selected."
 
-    # IMPORTANT: this is an f-string so {bank:.2f}, etc are interpolated.
+    # Ladder
+    favs = []
+    ladder_rows = ""
+    dutch_text = ""
+
+    if state.current_market_id and not state.day_done:
+        favs = client.get_top_two_favourites(state.current_market_id)
+
+    if len(favs) == 2 and not state.day_done:
+        o1 = favs[0]["back"]
+        o2 = favs[1]["back"]
+        s1, s2, total, profit = strategy.compute_dutch_for_current(o1, o2)
+
+        r1 = {**favs[0], "stake": round(s1, 2)}
+        r2 = {**favs[1], "stake": round(s2, 2)}
+        favs_with_stakes = [r1, r2]
+
+        dutch_text = (
+            f"Total stake this race: {total:.2f} · "
+            f"Expected profit if either favourite wins: {profit:.2f} · "
+            f"Losses so far: {state.losses_so_far:.2f}"
+        )
+    else:
+        favs_with_stakes = favs
+
+    for r in favs_with_stakes:
+        stake_display = f"{r['stake']:.2f}" if "stake" in r else "-"
+        ladder_rows += f"""
+          <tr>
+            <td class="runner-name">{r['name']}</td>
+            <td class="runner-odds">{r['back']}</td>
+            <td class="runner-odds">{r['lay']}</td>
+            <td class="runner-stake">{stake_display}</td>
+          </tr>
+        """
+
+    ladder_html = "<p class='muted'>No race selected yet. Pick races and start the day.</p>"
+    if state.current_market_id and state.current_market_name:
+        profit_line = f"<p class='ladder-note'>{dutch_text}</p>" if dutch_text else ""
+        ladder_html = f"""
+        <div class="section-header">
+          <h2>Current race ladder</h2>
+          <span class="chip chip-soft">{state.current_market_name}</span>
+        </div>
+        <div class="table-wrapper">
+          <table class="ladder-table">
+            <thead>
+              <tr>
+                <th>Runner</th>
+                <th>Back</th>
+                <th>Lay</th>
+                <th>Stake (dutch)</th>
+              </tr>
+            </thead>
+            <tbody>
+              {ladder_rows}
+            </tbody>
+          </table>
+        </div>
+        {profit_line}
+        """
+
+    # Recent history (last 10)
+    recent_history = list(getattr(state, "history", []))[-10:][::-1]  # newest first
+    if recent_history:
+        history_rows = ""
+        for h in recent_history:
+            timestamp = h.get("timestamp", "")
+            # Make timestamp a bit friendlier
+            ts_disp = (
+                timestamp.replace("T", " ").replace("Z", "")
+                if isinstance(timestamp, str)
+                else str(timestamp)
+            )
+            mname = h.get("market_name", h.get("market_id", ""))
+            pnl = float(h.get("pnl", 0.0))
+            bank_after = float(h.get("bank_after", 0.0))
+            pnl_color = "#22c55e" if pnl >= 0 else "#ef4444"
+            pnl_str = f"£{pnl:.2f}"
+            bank_str = f"£{bank_after:.2f}"
+
+            history_rows += f"""
+              <tr>
+                <td class="hist-time">{ts_disp}</td>
+                <td class="hist-race">{mname}</td>
+                <td class="hist-pl" style="color:{pnl_color};">{pnl_str}</td>
+                <td class="hist-bank">{bank_str}</td>
+              </tr>
+            """
+
+        history_html = f"""
+        <div class="section-header">
+          <h2>Recent results</h2>
+          <span class="chip chip-soft">Last {len(recent_history)} races</span>
+        </div>
+        <div class="table-wrapper">
+          <table class="history-table">
+            <thead>
+              <tr>
+                <th>Time (UTC)</th>
+                <th>Race</th>
+                <th>P/L</th>
+                <th>Bank after</th>
+              </tr>
+            </thead>
+            <tbody>
+              {history_rows}
+            </tbody>
+          </table>
+        </div>
+        """
+    else:
+        history_html = """
+        <div class="section-header">
+          <h2>Recent results</h2>
+          <span class="chip chip-soft">No races yet</span>
+        </div>
+        <p class="muted">No results yet. Mark races as WON or LOST to build history.</p>
+        """
+
+    mode_label = "live" if not client.use_dummy else "dummy"
+
     html = f"""
     <html>
-    <head>
-        <title>Betfair 2-Fav Dutching Bot</title>
-        <meta name="viewport" content="width=device-width, initial-scale=1" />
+      <head>
+        <title>Betfair Favourites Bot – Web UI</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
         <style>
-            * {{ box-sizing: border-box; }}
-            body {{
-                margin: 0;
-                font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-                background: #020617;
-                color: #e5e7eb;
+          :root {{
+            --bg: #020617;
+            --bg-elevated: rgba(15, 23, 42, 0.9);
+            --border-subtle: rgba(148, 163, 184, 0.2);
+            --accent: #22c55e;
+            --accent-soft: rgba(34, 197, 94, 0.12);
+            --accent-strong: #16a34a;
+            --danger: #ef4444;
+            --text-main: #e5e7eb;
+            --text-muted: #9ca3af;
+            --chip-bg: rgba(148, 163, 184, 0.16);
+          }}
+          * {{ box-sizing: border-box; }}
+          body {{
+            margin: 0;
+            padding: 0;
+            font-family: system-ui, -apple-system, BlinkMacSystemFont, "SF Pro Text",
+                         "Segoe UI", sans-serif;
+            color: var(--text-main);
+            background: radial-gradient(circle at top, #0f172a 0, #020617 55%, #000 100%);
+            min-height: 100vh;
+            display: flex;
+            align-items: flex-start;
+            justify-content: center;
+            overflow-x: hidden;
+          }}
+          .shell {{
+            width: 100%;
+            max-width: 1040px;
+            padding: 24px 12px 40px;
+          }}
+          @media (max-width: 768px) {{
+            .shell {{
+              padding: 16px 10px 28px;
             }}
-            a {{
-                color: #38bdf8;
-                text-decoration: none;
-            }}
-            a:hover {{ text-decoration: underline; }}
-            .page {{
-                max-width: 1200px;
-                margin: 0 auto;
-                padding: 14px;
-            }}
-            .top-bar {{
-                display: flex;
-                justify-content: space-between;
-                align-items: center;
-                gap: 8px;
-                margin-bottom: 12px;
-            }}
-            @media (max-width: 700px) {{
-                .top-bar {{
-                    flex-direction: column;
-                    align-items: flex-start;
-                }}
-            }}
-            h1 {{
-                margin: 0;
-                font-size: 1.4rem;
-            }}
-            .sub {{
-                font-size: 0.8rem;
-                color: #9ca3af;
-            }}
-            .pill {{
-                border-radius: 999px;
-                padding: 3px 8px;
-                font-size: 0.75rem;
-                display: inline-flex;
-                align-items: center;
-                gap: 4px;
-            }}
-            .pill.green {{
-                background: rgba(34,197,94,0.1);
-                border: 1px solid rgba(34,197,94,0.3);
-                color: #4ade80;
-            }}
-            .pill.red {{
-                background: rgba(248,113,113,0.1);
-                border: 1px solid rgba(248,113,113,0.3);
-                color: #fca5a5;
-            }}
-            .grid {{
-                display: grid;
-                grid-template-columns: 1.1fr 1fr;
-                gap: 14px;
-            }}
-            @media (max-width: 900px) {{
-                .grid {{
-                    grid-template-columns: 1fr;
-                }}
-            }}
+          }}
+          .card {{
+            background: var(--bg-elevated);
+            border-radius: 18px;
+            border: 1px solid var(--border-subtle);
+            box-shadow:
+              0 24px 60px rgba(15, 23, 42, 0.7),
+              0 0 0 1px rgba(15, 23, 42, 0.9);
+            padding: 20px 16px 24px;
+          }}
+          @media (min-width: 900px) {{
             .card {{
-                background: #020617;
-                border-radius: 16px;
-                border: 1px solid #1f2937;
-                padding: 12px 14px;
-                box-shadow: 0 20px 25px -5px rgba(0,0,0,0.4);
+              padding: 24px 24px 28px;
             }}
-            .card h2 {{
-                margin: 0 0 8px 0;
-                font-size: 1rem;
+          }}
+          h1 {{
+            margin: 0 0 4px;
+            font-size: 22px;
+            letter-spacing: 0.03em;
+            text-transform: uppercase;
+          }}
+          .subtitle {{
+            margin: 0 0 16px;
+            font-size: 13px;
+            color: var(--text-muted);
+          }}
+          .top-row {{
+            display: flex;
+            flex-wrap: wrap;
+            gap: 12px;
+            align-items: flex-start;
+            justify-content: space-between;
+            margin-bottom: 14px;
+          }}
+          .status-block {{
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            min-width: 0;
+          }}
+          .badges {{
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            align-items: center;
+          }}
+          .chip {{
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 4px 9px;
+            border-radius: 999px;
+            font-size: 11px;
+            letter-spacing: 0.05em;
+            text-transform: uppercase;
+            border: 1px solid transparent;
+            white-space: nowrap;
+          }}
+          .chip-status {{
+            background: rgba(15, 23, 42, 0.9);
+            border-color: {status_color};
+            color: {status_color};
+          }}
+          .chip-day {{
+            background: rgba(15, 23, 42, 0.9);
+            border-color: {day_color};
+            color: {day_color};
+          }}
+          .chip-soft {{
+            background: var(--chip-bg);
+            border-color: transparent;
+            color: var(--text-main);
+          }}
+          .current-info {{
+            font-size: 13px;
+            color: var(--text-muted);
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            max-width: 100%;
+          }}
+          .controls {{
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+            justify-content: flex-end;
+          }}
+          .btn {{
+            border: 0;
+            border-radius: 999px;
+            padding: 7px 11px;
+            font-size: 12px;
+            cursor: pointer;
+            font-weight: 500;
+            letter-spacing: 0.03em;
+            text-transform: uppercase;
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            transition: all 0.16s ease-out;
+            white-space: nowrap;
+          }}
+          .btn-primary {{
+            background: var(--accent);
+            color: #022c22;
+          }}
+          .btn-primary:hover {{
+            background: var(--accent-strong);
+            transform: translateY(-1px);
+            box-shadow: 0 10px 20px rgba(34, 197, 94, 0.35);
+          }}
+          .btn-ghost {{
+            background: transparent;
+            color: var(--text-main);
+            border: 1px solid var(--border-subtle);
+          }}
+          .btn-ghost:hover {{
+            background: rgba(148, 163, 184, 0.12);
+            transform: translateY(-1px);
+          }}
+          .btn-danger {{
+            background: rgba(248, 113, 113, 0.18);
+            color: #fecaca;
+            border: 1px solid rgba(248, 113, 113, 0.7);
+          }}
+          .btn-danger:hover {{
+            background: rgba(248, 113, 113, 0.3);
+            transform: translateY(-1px);
+          }}
+          .grid {{
+            display: grid;
+            grid-template-columns: minmax(0, 1.10fr) minmax(0, 1.05fr);
+            gap: 16px;
+            margin-top: 18px;
+          }}
+          @media (max-width: 900px) {{
+            .grid {{
+              grid-template-columns: 1fr;
             }}
-            .card h3 {{
-                margin: 8px 0 6px 0;
-                font-size: 0.95rem;
+          }}
+          .panel {{
+            background: rgba(15, 23, 42, 0.7);
+            border-radius: 16px;
+            border: 1px solid var(--border-subtle);
+            padding: 14px 12px 16px;
+          }}
+          @media (min-width: 900px) {{
+            .panel {{
+              padding: 16px 18px 18px;
             }}
-            label {{
-                display: block;
-                font-size: 0.8rem;
-                margin-bottom: 3px;
-                color: #9ca3af;
+          }}
+          .panel h2 {{
+            margin: 0 0 10px;
+            font-size: 15px;
+          }}
+          .section-header {{
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 10px;
+            margin-bottom: 8px;
+          }}
+          .section-header h2 {{
+            margin: 0;
+          }}
+          .race-list {{
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            max-height: 260px;
+            overflow-y: auto;
+            padding-right: 4px;
+          }}
+          .race-item {{
+            display: block;
+            cursor: pointer;
+          }}
+          .race-item input[type="checkbox"] {{
+            display: none;
+          }}
+          .race-card {{
+            display: flex;
+            flex-direction: column;
+            gap: 3px;
+            padding: 8px 9px;
+            border-radius: 10px;
+            border: 1px solid var(--border-subtle);
+            background: rgba(15, 23, 42, 0.9);
+            transition: all 0.15s ease-out;
+          }}
+          .race-item input[type="checkbox"]:checked + .race-card {{
+            border-color: var(--accent);
+            box-shadow: 0 0 0 1px rgba(34, 197, 94, 0.7);
+          }}
+          .race-card:hover {{
+            border-color: rgba(148, 163, 184, 0.9);
+            transform: translateY(-1px);
+          }}
+          .race-name {{
+            font-size: 13px;
+          }}
+          .race-tag {{
+            font-size: 11px;
+            color: var(--accent);
+            text-transform: uppercase;
+            letter-spacing: 0.09em;
+          }}
+          .race-actions {{
+            margin-top: 8px;
+            text-align: right;
+          }}
+          .table-wrapper {{
+            border-radius: 12px;
+            border: 1px solid var(--border-subtle);
+            overflow: hidden;
+            background: rgba(15, 23, 42, 0.9);
+          }}
+          .ladder-table,
+          .history-table {{
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 13px;
+          }}
+          .ladder-table thead,
+          .history-table thead {{
+            background: rgba(15, 23, 42, 0.95);
+          }}
+          .ladder-table th,
+          .ladder-table td,
+          .history-table th,
+          .history-table td {{
+            padding: 6px 8px;
+            text-align: left;
+          }}
+          .ladder-table th,
+          .history-table th {{
+            font-weight: 500;
+            color: var(--text-muted);
+            border-bottom: 1px solid var(--border-subtle);
+          }}
+          .ladder-table tbody tr:nth-child(even),
+          .history-table tbody tr:nth-child(even) {{
+            background: rgba(15, 23, 42, 0.9);
+          }}
+          .ladder-table tbody tr:nth-child(odd),
+          .history-table tbody tr:nth-child(odd) {{
+            background: rgba(15, 23, 42, 0.8);
+          }}
+          .runner-name {{
+            font-weight: 500;
+          }}
+          .runner-odds {{
+            text-align: center;
+            font-variant-numeric: tabular-nums;
+          }}
+          .runner-stake {{
+            text-align: center;
+            font-variant-numeric: tabular-nums;
+            color: var(--accent);
+          }}
+          .hist-time {{
+            font-size: 12px;
+            color: var(--text-muted);
+          }}
+          .hist-race {{
+            font-size: 13px;
+          }}
+          .hist-pl,
+          .hist-bank {{
+            font-variant-numeric: tabular-nums;
+            text-align: right;
+          }}
+          .ladder-note {{
+            margin-top: 8px;
+            font-size: 12px;
+            color: var(--text-muted);
+          }}
+          .settings-form {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            gap: 8px 10px;
+            margin-top: 8px;
+          }}
+          .field-label {{
+            display: flex;
+            flex-direction: column;
+            gap: 3px;
+            font-size: 12px;
+            color: var(--text-muted);
+          }}
+          .field-label span {{
+            font-size: 11px;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+          }}
+          .field-label input {{
+            border-radius: 999px;
+            border: 1px solid var(--border-subtle);
+            background: rgba(15, 23, 42, 0.9);
+            color: var(--text-main);
+            padding: 6px 9px;
+            font-size: 13px;
+            width: 100%;
+          }}
+          .field-label input:focus {{
+            outline: none;
+            border-color: var(--accent);
+            box-shadow: 0 0 0 1px rgba(34, 197, 94, 0.6);
+          }}
+          .settings-footer {{
+            margin-top: 10px;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+          }}
+          .profile-row {{
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            align-items: center;
+            justify-content: space-between;
+          }}
+          .profile-label {{
+            font-size: 11px;
+            text-transform: uppercase;
+            letter-spacing: 0.09em;
+            color: var(--text-muted);
+          }}
+          .profile-buttons {{
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+          }}
+          .profile-buttons .btn {{
+            padding: 4px 9px;
+            font-size: 11px;
+          }}
+          .muted {{
+            color: var(--text-muted);
+            font-size: 13px;
+          }}
+          .message {{
+            margin-top: 8px;
+            padding: 6px 10px;
+            border-radius: 10px;
+            background: rgba(34, 197, 94, 0.08);
+            border: 1px solid rgba(34, 197, 94, 0.35);
+            font-size: 12px;
+            color: #bbf7d0;
+          }}
+          .bank-row {{
+            margin-top: 10px;
+            margin-bottom: 4px;
+          }}
+          .bank-card {{
+            display: grid;
+            grid-template-columns: repeat(4, minmax(0, 1fr));
+            gap: 10px;
+            border-radius: 14px;
+            border: 1px solid var(--border-subtle);
+            background: rgba(15, 23, 42, 0.9);
+            padding: 9px 10px;
+          }}
+          @media (max-width: 700px) {{
+            .bank-card {{
+              grid-template-columns: repeat(2, minmax(0, 1fr));
             }}
-            input[type="number"], input[type="text"] {{
-                width: 100%;
-                padding: 6px 8px;
-                border-radius: 8px;
-                border: 1px solid #374151;
-                background: #020617;
-                color: #e5e7eb;
-                font-size: 0.85rem;
-            }}
-            .row {{
-                display: flex;
-                flex-wrap: wrap;
-                gap: 8px;
-            }}
-            .row > div {{
-                flex: 1;
-                min-width: 130px;
-            }}
-            .btn {{
-                border-radius: 999px;
-                padding: 6px 12px;
-                border: none;
-                cursor: pointer;
-                font-size: 0.8rem;
-                font-weight: 600;
-                display: inline-flex;
-                align-items: center;
-                gap: 6px;
-            }}
-            .btn-primary {{
-                background: linear-gradient(135deg, #22c55e, #16a34a);
-                color: white;
-            }}
-            .btn-secondary {{
-                background: #0f172a;
-                color: #e5e7eb;
-                border: 1px solid #374151;
-            }}
-            .btn-danger {{
-                background: #b91c1c;
-                color: white;
-            }}
-            .btn-small {{
-                padding: 4px 10px;
-                font-size: 0.75rem;
-            }}
-            .message {{
-                font-size: 0.8rem;
-                color: #f97316;
-                margin-bottom: 6px;
-            }}
-            .green-text {{ color: #4ade80; }}
-            .red-text {{ color: #fca5a5; }}
-            .history-table {{
-                width: 100%;
-                border-collapse: collapse;
-                font-size: 0.8rem;
-            }}
-            .history-table th, .history-table td {{
-                padding: 4px 6px;
-                border-bottom: 1px solid #1f2937;
-            }}
-            .history-table th {{
-                text-align: left;
-                color: #9ca3af;
-            }}
-            .history-table tr:last-child td {{
-                border-bottom: none;
-            }}
+          }}
+          .bank-metric {{
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
+          }}
+          .bank-label {{
+            font-size: 11px;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            color: var(--text-muted);
+          }}
+          .bank-value {{
+            font-size: 14px;
+            font-variant-numeric: tabular-nums;
+          }}
+          .bank-actions {{
+            margin-top: 6px;
+            text-align: right;
+          }}
+          .footer-note {{
+            margin-top: 18px;
+            font-size: 11px;
+            color: var(--text-muted);
+          }}
         </style>
-    </head>
-    <body>
-        <div class="page">
-            <div class="top-bar">
-                <div>
-                    <h1>Betfair 2-Fav Dutching Bot</h1>
-                    <div class="sub">
-                        Logged in as <strong>{ADMIN_USERNAME}</strong> |
-                        <a href="/logout">Log out</a> |
-                        <a href="/inspect_hurdles">Inspect Hurdles</a>
-                    </div>
+      </head>
+      <body>
+        <div class="shell">
+          <div class="card">
+            <h1>Betfair Favourites Bot</h1>
+            <p class="subtitle">Novice hurdles · 2-favourite dutching · Timed entry (simulated)</p>
+
+            <div class="top-row">
+              <div class="status-block">
+                <div class="badges">
+                  <span class="chip chip-status">
+                    Status: {status}
+                  </span>
+                  <span class="chip chip-day">
+                    Day: {day_status}
+                  </span>
+                  <span class="chip chip-soft">
+                    Exchange: Betfair ({mode_label})
+                  </span>
                 </div>
-                <div style="text-align:right;">
-                    <div class="pill {'green' if running else 'red'}">
-                        <span style="font-size:0.65rem;">●</span>
-                        {"Running" if running else "Stopped"}
-                    </div><br/>
-                    <span class="sub">
-                        Mode: {"DUMMY" if USE_DUMMY else "LIVE READ-ONLY (no bets placed)"}
-                    </span>
+                <div class="current-info">
+                  {current_info}
                 </div>
+              </div>
+
+              <div class="controls">
+                <form method="post" action="/start_day">
+                  <button class="btn btn-primary" type="submit">Start Day</button>
+                </form>
+                <form method="post" action="/stop">
+                  <button class="btn btn-ghost" type="submit">Stop</button>
+                </form>
+                <form method="post" action="/race_won">
+                  <button class="btn btn-ghost" type="submit">Race WON</button>
+                </form>
+                <form method="post" action="/race_lost">
+                  <button class="btn btn-danger" type="submit">Race LOST</button>
+                </form>
+                <form method="post" action="/logout">
+                  <button class="btn btn-ghost" type="submit">Logout</button>
+                </form>
+              </div>
+            </div>
+
+            <div class="bank-row">
+              <div class="bank-card">
+                <div class="bank-metric">
+                  <div class="bank-label">Start bank</div>
+                  <div class="bank-value">£{bank_start:.2f}</div>
+                </div>
+                <div class="bank-metric">
+                  <div class="bank-label">Current bank</div>
+                  <div class="bank-value">£{bank_now:.2f}</div>
+                </div>
+                <div class="bank-metric">
+                  <div class="bank-label">Today's P/L</div>
+                  <div class="bank-value" style="color:{pl_color};">
+                    £{pl_today:.2f}
+                  </div>
+                </div>
+                <div class="bank-metric">
+                  <div class="bank-label">Betfair balance</div>
+                  <div class="bank-value">{bf_balance_display}</div>
+                </div>
+              </div>
+              <div class="bank-actions">
+                <form method="post" action="/reset_bank">
+                  <button class="btn btn-ghost" type="submit">Reset bank</button>
+                </form>
+              </div>
             </div>
 
             {"<div class='message'>" + message + "</div>" if message else ""}
 
             <div class="grid">
-                <!-- LEFT: settings + races -->
-                <div class="card">
-                    <h2>Bank, Staking & Races</h2>
-
-                    <form method="POST" action="/update_settings">
-                        <div class="row">
-                            <div>
-                                <label for="starting_bank">Starting bank (£)</label>
-                                <input type="number" step="0.01" name="starting_bank" id="starting_bank"
-                                       value="{getattr(state, 'starting_bank', 100.0)}" />
-                            </div>
-                            <div>
-                                <label for="current_bank">Current bank (£)</label>
-                                <input type="number" step="0.01" name="current_bank" id="current_bank"
-                                       value="{getattr(state, 'bank', 100.0)}" />
-                            </div>
-                        </div>
-
-                        <div class="row" style="margin-top:8px;">
-                            <div>
-                                <label for="target_profit">Target profit for day (£)</label>
-                                <input type="number" step="0.01" name="target_profit" id="target_profit"
-                                       value="{getattr(state, 'target_profit', 5.0)}" />
-                            </div>
-                            <div>
-                                <label for="stake_percent">Stake % of bank per race</label>
-                                <input type="number" step="0.1" name="stake_percent" id="stake_percent"
-                                       value="{getattr(state, 'stake_percent', 5.0)}" />
-                            </div>
-                        </div>
-
-                        <div class="row" style="margin-top:8px;">
-                            <div>
-                                <label for="min_odds">Min odds (fav)</label>
-                                <input type="number" step="0.01" name="min_odds" id="min_odds"
-                                       value="{getattr(state, 'min_odds', 1.5)}" />
-                            </div>
-                            <div>
-                                <label for="max_odds">Max odds (fav)</label>
-                                <input type="number" step="0.01" name="max_odds" id="max_odds"
-                                       value="{getattr(state, 'max_odds', 4.5)}" />
-                            </div>
-                        </div>
-
-                        <div class="row" style="margin-top:8px;">
-                            <div>
-                                <label for="seconds_before_off">Place bets (seconds before off)</label>
-                                <input type="number" step="1" name="seconds_before_off" id="seconds_before_off"
-                                       value="{getattr(state, 'seconds_before_off', 60)}" />
-                            </div>
-                        </div>
-
-                        <div style="margin-top:10px;">
-                            <span class="sub">Quick stake profiles (% of bank):</span><br/>
-                            <button class="btn btn-secondary btn-small" name="profile" value="2">2%</button>
-                            <button class="btn btn-secondary btn-small" name="profile" value="5">5%</button>
-                            <button class="btn btn-secondary btn-small" name="profile" value="10">10%</button>
-                            <button class="btn btn-secondary btn-small" name="profile" value="15">15%</button>
-                            <button class="btn btn-secondary btn-small" name="profile" value="20">20%</button>
-                        </div>
-
-                        <div style="margin-top:10px;">
-                            <button type="submit" class="btn btn-primary">Save settings</button>
-                            <button type="submit" name="reset_bank" value="1" class="btn btn-secondary">
-                                Reset bank to starting
-                            </button>
-                        </div>
-                    </form>
-
-                    <hr style="border-color:#1f2937; margin:14px 0;" />
-
-                    <h3>Available Races Today</h3>
-                    <div class="sub" style="margin-bottom:6px;">
-                        From Betfair (horse racing, relaxed filter – novice hurdles preferred).
-                    </div>
-    """
-
-    if not markets:
-        html += """
-                    <p style="color:#f97316;font-size:0.8rem;">
-                        No markets returned by Betfair. Check API / filters.
-                    </p>
-        """
-
-    html += """
-                    <form method="POST" action="/update_race_selection">
-                        <div style="max-height:260px; overflow-y:auto; border-radius:8px;
-                                    border:1px solid #1f2937; padding:8px;">
-    """
-
-    for m in markets:
-        mid = m["market_id"]
-        name = m["name"]
-        checked = "checked" if mid in selected_ids else ""
-        html += f"""
-                            <label style="display:flex;align-items:center;gap:6px;font-size:0.8rem;padding:2px 0;">
-                                <input type="checkbox" name="selected_markets" value="{mid}" {checked} />
-                                <span>{name}</span>
-                            </label>
-        """
-
-    html += """
-                        </div>
-                        <div style="margin-top:8px;">
-                            <button type="submit" class="btn btn-secondary btn-small">
-                                Save race selection
-                            </button>
-                        </div>
-                    </form>
+              <div class="panel">
+                <div class="section-header">
+                  <h2>Today's novice hurdle markets</h2>
+                  <span class="chip chip-soft">Exchange data source</span>
                 </div>
+                <form method="post" action="/update_race_selection">
+                  <div class="race-list">
+                    {race_list_html}
+                  </div>
+                  <div class="race-actions">
+                    <button class="btn btn-ghost" type="submit">Save race list</button>
+                  </div>
+                </form>
+              </div>
 
-                <!-- RIGHT: status, controls, history -->
-                <div class="card">
-                    <h2>Status & Controls</h2>
-                    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
-                        <div>
-                            <div class="sub">Current bank</div>
-                            <div style="font-size:1.2rem;">£{bank:.2f}</div>
-                        </div>
-                        <div>
-                            <div class="sub">Day P/L</div>
-                            <div class="{ 'green-text' if day_pl >= 0 else 'red-text' }">
-                                £{day_pl:.2f}
-                            </div>
-                        </div>
-                        <div>
-                            <div class="sub">Betfair balance</div>
-                            <div style="font-size:0.9rem;">
-                                {"£" + f"{bf_balance:.2f}" if bf_balance is not None else "–"}
-                            </div>
-                        </div>
-                    </div>
-
-                    <form method="POST" action="/start">
-                        <button type="submit" class="btn btn-primary">▶ Start Bot</button>
-                    </form>
-                    <form method="POST" action="/stop" style="margin-top:6px;">
-                        <button type="submit" class="btn btn-danger">■ Stop Bot</button>
-                    </form>
-
-                    <div style="margin-top:12px;">
-                        <span class="sub">Manual race outcome (until auto-result is wired in):</span><br/>
-                        <form method="POST" action="/race_won" style="display:inline;">
-                            <button type="submit" class="btn btn-secondary btn-small">Race WON</button>
-                        </form>
-                        <form method="POST" action="/race_lost" style="display:inline;">
-                            <button type="submit" class="btn btn-secondary btn-small">Race LOST</button>
-                        </form>
-                    </div>
-
-                    <hr style="border-color:#1f2937; margin:14px 0;" />
-
-                    <h3>Recent Races & P/L</h3>
-                    <table class="history-table">
-                        <tr>
-                            <th>#</th>
-                            <th>Race</th>
-                            <th>Favourites</th>
-                            <th>Stake</th>
-                            <th>P/L</th>
-                        </tr>
-    """
-
-    if recent_history:
-        for idx, row in enumerate(recent_history, 1):
-            race_name = row.get("race_name", "?")
-            favs = row.get("favs", "Top 2 favourites")
-            stake = row.get("total_stake", 0.0)
-            pl = row.get("pl", 0.0)
-            cls = "green-text" if pl >= 0 else "red-text"
-            html += f"""
-                        <tr>
-                            <td>{idx}</td>
-                            <td>{race_name}</td>
-                            <td>{favs}</td>
-                            <td>£{stake:.2f}</td>
-                            <td class="{cls}">£{pl:.2f}</td>
-                        </tr>
-            """
-    else:
-        html += """
-                        <tr>
-                            <td colspan="5" class="sub">No races yet.</td>
-                        </tr>
-        """
-
-    html += """
-                    </table>
-                </div>
+              <div class="panel">
+                {ladder_html}
+              </div>
             </div>
+
+            <div class="panel" style="margin-top: 18px;">
+              <div class="section-header">
+                <h2>Settings</h2>
+                <span class="chip chip-soft">Risk &amp; banking controls</span>
+              </div>
+              <form method="post" action="/settings">
+                <div class="settings-form">
+                  <label class="field-label">
+                    <span>Starting bank (£)</span>
+                    <input type="text" name="starting_bank" value="{state.current_bank}"/>
+                  </label>
+                  <label class="field-label">
+                    <span>Min favourite odds</span>
+                    <input type="text" name="min_fav_odds" value="{state.min_fav_odds}"/>
+                  </label>
+                  <label class="field-label">
+                    <span>Max favourite odds</span>
+                    <input type="text" name="max_fav_odds" value="{state.max_fav_odds}"/>
+                  </label>
+                  <label class="field-label">
+                    <span>Target profit per winning race</span>
+                    <input type="text" name="target_profit_per_win" value="{state.target_profit_per_win}"/>
+                  </label>
+                  <label class="field-label">
+                    <span>Max daily loss</span>
+                    <input type="text" name="max_daily_loss" value="{state.max_daily_loss}"/>
+                  </label>
+                </div>
+                <div class="settings-footer">
+                  <button class="btn btn-primary" type="submit">Save settings</button>
+                </div>
+              </form>
+
+              <form method="post" action="/apply_profile">
+                <div class="settings-footer">
+                  <div class="profile-row">
+                    <div class="profile-label">
+                      Quick profiles (profit &amp; daily loss as % of current bank):
+                    </div>
+                    <div class="profile-buttons">
+                      <button class="btn btn-ghost" type="submit" name="profile_pct" value="2">2%</button>
+                      <button class="btn btn-ghost" type="submit" name="profile_pct" value="5">5%</button>
+                      <button class="btn btn-ghost" type="submit" name="profile_pct" value="10">10%</button>
+                      <button class="btn btn-ghost" type="submit" name="profile_pct" value="15">15%</button>
+                      <button class="btn btn-ghost" type="submit" name="profile_pct" value="20">20%</button>
+                    </div>
+                  </div>
+                </div>
+              </form>
+            </div>
+
+            <div class="panel" style="margin-top: 18px;">
+              {history_html}
+            </div>
+
+            <p class="footer-note">
+              All "1 minute before off" actions are simulated only – no real bets are placed by this code.<br/>
+              When you're ready, we can swap the simulated log line for a Betfair placeOrders call with safety limits.
+            </p>
+          </div>
         </div>
-    </body>
+      </body>
     </html>
     """
-
-    return HTMLResponse(html)
-
-
-# --------------------------------------------------------
-# Routes: auth
-# --------------------------------------------------------
-
-@app.get("/login")
-async def login_get(request: Request):
-    if is_logged_in(request):
-        return RedirectResponse("/", status_code=303)
-    return render_login_page()
+    return HTMLResponse(content=html)
 
 
-@app.post("/login")
-async def login_post(
-    request: Request,
-    username: str = Form(...),
-    password: str = Form(...),
-):
-    if username == ADMIN_USERNAME and password == ADMIN_PASSWORD:
-        request.session["user"] = "admin"
-        return RedirectResponse("/", status_code=303)
-    else:
-        return render_login_page("Invalid username or password.")
-
-
-@app.get("/logout")
-async def logout(request: Request):
-    request.session.clear()
-    return RedirectResponse("/login", status_code=303)
-
-
-# --------------------------------------------------------
-# Routes: main dashboard
-# --------------------------------------------------------
+# ======================
+# Routes (all protected)
+# ======================
 
 @app.get("/", response_class=HTMLResponse)
-async def root(request: Request):
-    redirect = require_login(request)
-    if redirect:
-        return redirect
+async def dashboard(request: Request):
+    if not is_authenticated(request):
+        return RedirectResponse("/login", status_code=303)
     return render_dashboard()
 
 
-# --------------------------------------------------------
-# Routes: settings & race selection
-# --------------------------------------------------------
-
-@app.post("/update_settings")
-async def update_settings(
-    request: Request,
-    starting_bank: float = Form(...),
-    current_bank: float = Form(...),
-    target_profit: float = Form(...),
-    stake_percent: float = Form(...),
-    min_odds: float = Form(...),
-    max_odds: float = Form(...),
-    seconds_before_off: int = Form(...),
-    profile: str = Form(None),
-    reset_bank: str = Form(None),
-):
-    redirect = require_login(request)
-    if redirect:
-        return redirect
-
-    state.starting_bank = starting_bank
-
-    if reset_bank:
-        state.bank = starting_bank
-    else:
-        state.bank = current_bank
-
-    state.target_profit = target_profit
-    state.min_odds = min_odds
-    state.max_odds = max_odds
-    state.seconds_before_off = seconds_before_off
-
-    # Quick profiles override stake_percent if chosen
-    if profile in ("2", "5", "10", "15", "20"):
-        state.stake_percent = float(profile)
-    else:
-        state.stake_percent = stake_percent
-
-    return render_dashboard("Settings saved.")
+@app.post("/start_day", response_class=HTMLResponse)
+async def start_day(request: Request):
+    if not is_authenticated(request):
+        return RedirectResponse("/login", status_code=303)
+    bot.start_day()
+    return render_dashboard("Day started. Working through your selected races in order.")
 
 
-@app.post("/update_race_selection")
-async def update_race_selection(request: Request):
-    redirect = require_login(request)
-    if redirect:
-        return redirect
-
-    form = await request.form()
-    selected = form.getlist("selected_markets")
-    state.selected_markets = selected
-    state.current_index = 0  # reset sequence when user changes selection
-    print("[WEBAPP] User selected markets:", selected)
-
-    return render_dashboard("Race selection updated.")
-
-
-# --------------------------------------------------------
-# Routes: bot control
-# --------------------------------------------------------
-
-@app.post("/start")
-async def start_bot(request: Request):
-    redirect = require_login(request)
-    if redirect:
-        return redirect
-
-    if not getattr(state, "selected_markets", []):
-        return render_dashboard("No races selected – tick at least one race and save.")
-
-    try:
-        runner.start()
-    except Exception as e:
-        print("[WEBAPP] Error starting bot:", e)
-        return render_dashboard(f"Error starting bot: {e}")
-
-    return render_dashboard("Bot started.")
-
-
-@app.post("/stop")
+@app.post("/stop", response_class=HTMLResponse)
 async def stop_bot(request: Request):
-    redirect = require_login(request)
-    if redirect:
-        return redirect
-
-    try:
-        runner.stop()
-    except Exception as e:
-        print("[WEBAPP] Error stopping bot:", e)
-        return render_dashboard(f"Error stopping bot: {e}")
-
+    if not is_authenticated(request):
+        return RedirectResponse("/login", status_code=303)
+    bot.stop()
     return render_dashboard("Bot stopped.")
 
 
-@app.post("/race_won")
+@app.post("/race_won", response_class=HTMLResponse)
 async def race_won(request: Request):
-    redirect = require_login(request)
-    if redirect:
-        return redirect
-
-    try:
-        runner.mark_race_won()
-    except Exception as e:
-        print("[WEBAPP] Error marking race as won:", e)
-        return render_dashboard(f"Error marking race as WON: {e}")
-
-    return render_dashboard("Race marked as WON.")
+    if not is_authenticated(request):
+        return RedirectResponse("/login", status_code=303)
+    bot.on_race_won_manual()
+    return render_dashboard("Race marked as WON. Day stopped.")
 
 
-@app.post("/race_lost")
+@app.post("/race_lost", response_class=HTMLResponse)
 async def race_lost(request: Request):
-    redirect = require_login(request)
-    if redirect:
-        return redirect
+    if not is_authenticated(request):
+        return RedirectResponse("/login", status_code=303)
+    bot.on_race_lost_manual()
+    return render_dashboard("Race marked as LOST. Moving on if possible.")
+
+
+@app.post("/update_race_selection", response_class=HTMLResponse)
+async def update_race_selection(
+    request: Request,
+    market_ids: List[str] = Form(default=[]),
+):
+    if not is_authenticated(request):
+        return RedirectResponse("/login", status_code=303)
+
+    state.selected_market_ids = market_ids
+    state.current_index = 0
+    strategy.update_current_market(client.get_market_name)
+    return render_dashboard("Race list updated.")
+
+
+@app.post("/settings", response_class=HTMLResponse)
+async def update_settings(
+    request: Request,
+    starting_bank: str = Form(...),
+    min_fav_odds: str = Form(...),
+    max_fav_odds: str = Form(...),
+    target_profit_per_win: str = Form(...),
+    max_daily_loss: str = Form(...),
+):
+    if not is_authenticated(request):
+        return RedirectResponse("/login", status_code=303)
 
     try:
-        runner.mark_race_lost()
+        bank_val = float(starting_bank)
+        state.current_bank = bank_val
+        state.starting_bank = bank_val
+
+        state.min_fav_odds = float(min_fav_odds)
+        state.max_fav_odds = max(state.min_fav_odds, float(max_fav_odds))
+        state.target_profit_per_win = max(0.01, float(target_profit_per_win))
+        state.max_daily_loss = max(0.01, float(max_daily_loss))
+        msg = "Settings updated."
     except Exception as e:
-        print("[WEBAPP] Error marking race as lost:", e)
-        return render_dashboard(f"Error marking race as LOST: {e}")
+        print("[SETTINGS ERROR]", e)
+        msg = "Error updating settings. Please check your values."
 
-    return render_dashboard("Race marked as LOST.")
+    return render_dashboard(msg)
 
 
-# --------------------------------------------------------
-# Debug route: inspect today's horse markets & novice hurdles
-# --------------------------------------------------------
+@app.post("/reset_bank", response_class=HTMLResponse)
+async def reset_bank(request: Request):
+    if not is_authenticated(request):
+        return RedirectResponse("/login", status_code=303)
 
-@app.get("/inspect_hurdles", response_class=HTMLResponse)
-async def inspect_hurdles(request: Request):
-    redirect = require_login(request)
-    if redirect:
-        return redirect
+    state.current_bank = state.starting_bank
+    state.todays_pl = 0.0
+    state.races_played = 0
+    state.losses_so_far = 0.0
+    state.day_done = False
+    bot.stop()
+    return render_dashboard("Bank reset to starting value for this session.")
 
-    today_utc = dt.datetime.utcnow().date()
-    html_parts = []
-    html_parts.append("<html><head><title>Inspect Hurdles</title></head><body>")
-    html_parts.append(f"<h2>Horse markets for today (UTC date = {today_utc})</h2>")
-    html_parts.append("<p>This debug view shows exactly how Betfair names today's horse races.</p>")
-    html_parts.append("<p><a href='/'>⬅ Back to dashboard</a></p>")
 
-    if client.use_dummy:
-        html_parts.append("<p style='color:orange;'>Client is in DUMMY mode – switch to live to see real markets.</p>")
-        html_parts.append("</body></html>")
-        return HTMLResponse("".join(html_parts))
-
-    params = {
-        "filter": {"eventTypeIds": ["7"]},  # Horse Racing
-        "maxResults": 200,
-        "marketProjection": ["MARKET_START_TIME", "EVENT"],
-    }
+@app.post("/apply_profile", response_class=HTMLResponse)
+async def apply_profile(
+    request: Request,
+    profile_pct: str = Form(...),
+):
+    if not is_authenticated(request):
+        return RedirectResponse("/login", status_code=303)
 
     try:
-        result = client._rpc("listMarketCatalogue", params)
+        pct = float(profile_pct)
+        factor = pct / 100.0
+        base = max(state.current_bank, 0.0)
+
+        state.target_profit_per_win = round(base * factor, 2)
+        state.max_daily_loss = round(base * factor * 4, 2)
+
+        msg = (
+            f"{pct:.0f}% profile applied: "
+            f"target profit £{state.target_profit_per_win:.2f}, "
+            f"max daily loss £{state.max_daily_loss:.2f}."
+        )
     except Exception as e:
-        html_parts.append(f"<p style='color:red;'>Error calling listMarketCatalogue: {e}</p>")
-        html_parts.append("</body></html>")
-        return HTMLResponse("".join(html_parts))
+        print("[PROFILE ERROR]", e)
+        msg = "Error applying profile. Please try again."
 
-    html_parts.append(f"<p>Betfair returned <strong>{len(result)}</strong> horse markets total.</p>")
-
-    rows = []
-    idx_today = 0
-
-    for m in result:
-        market_id = m.get("marketId")
-        market_name = m.get("marketName", "")
-        event = m.get("event", {}) or {}
-        event_name = event.get("name", "")
-        venue = event.get("venue", "")
-        open_date_str = event.get("openDate", "")
-
-        event_date = None
-        if open_date_str:
-            try:
-                s = open_date_str
-                if s.endswith("Z"):
-                    s = s.replace("Z", "+00:00")
-                dt_val = dt.datetime.fromisoformat(s)
-                event_date = dt_val.date()
-            except Exception:
-                event_date = None
-
-        if event_date != today_utc:
-            continue
-
-        idx_today += 1
-        lower_name = market_name.lower()
-
-        tags = []
-        if any(x in lower_name for x in ["hurdle", "hurd", "hrd"]):
-            tags.append("HURDLE")
-        if any(x in lower_name for x in ["novice", "nov ", "nov.", "nov hrd", "nov hdl", "nov hcap"]):
-            tags.append("NOVICE?")
-
-        tag_str = " | ".join(tags) if tags else ""
-        rows.append((market_id, event_name, venue, market_name, tag_str))
-
-    if idx_today == 0:
-        html_parts.append("<p style='color:orange;'>No horse markets with openDate == today (UTC) found.</p>")
-        html_parts.append("</body></html>")
-        return HTMLResponse("".join(html_parts))
-
-    html_parts.append(f"<p>Showing <strong>{idx_today}</strong> horse markets whose event date is today (UTC).</p>")
-    html_parts.append("""
-        <table border="1" cellspacing="0" cellpadding="4" style="font-size:0.8rem;border-color:#1f2937;">
-            <tr style="background:#111827;color:#e5e7eb;">
-                <th>#</th>
-                <th>Tags</th>
-                <th>MarketId</th>
-                <th>Event</th>
-                <th>Venue</th>
-                <th>Market Name</th>
-            </tr>
-    """)
-
-    for idx, (market_id, event_name, venue, market_name, tag_str) in enumerate(rows, 1):
-        tag_html = f"<span style='color:#f97316;'>{tag_str}</span>" if tag_str else ""
-        html_parts.append(f"""
-            <tr>
-                <td>{idx}</td>
-                <td>{tag_html}</td>
-                <td>{market_id}</td>
-                <td>{event_name}</td>
-                <td>{venue}</td>
-                <td>{market_name}</td>
-            </tr>
-        """)
-
-    html_parts.append("</table></body></html>")
-    return HTMLResponse("".join(html_parts))
-
-
-# --------------------------------------------------------
-# Local dev entrypoint
-# --------------------------------------------------------
-
-if __name__ == "__main__":
-    import uvicorn
-
-    uvicorn.run("webapp:app", host="0.0.0.0", port=8000, reload=True)
+    return render_dashboard(msg)
