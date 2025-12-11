@@ -43,7 +43,7 @@ app.add_middleware(SessionMiddleware, secret_key=SESSION_SECRET)
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "adamhill")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "Adamhillonline1!")
 
-USE_DUMMY = os.getenv("BETFAIR_DUMMY", "false").lower() == "true"
+USE_DUMMY = os.getenv("BETFAIR_DUMMY", "true").lower() == "true"
 
 # --------------------------------------------------------
 # Global client, strategy state, runner
