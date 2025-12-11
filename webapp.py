@@ -9,9 +9,7 @@
 #   - Race selection: today's horse markets from BetfairClient
 #   - Bot control: Start / Stop / Race WON / Race LOST
 #   - Simple recent P/L history
-#   - Debug routes:
-#       /inspect_hurdles      -> today's horse markets
-#       /inspect_event_types  -> listEventTypes for your account
+#   - Debug route: /inspect_hurdles to inspect today's horse markets names
 #
 # Depends on:
 #   betfair_client.py  (BetfairClient)
@@ -31,6 +29,7 @@ from starlette.middleware.sessions import SessionMiddleware
 from betfair_client import BetfairClient
 from strategy import StrategyState, BotRunner
 
+
 # --------------------------------------------------------
 # App & middleware
 # --------------------------------------------------------
@@ -43,6 +42,9 @@ app.add_middleware(SessionMiddleware, secret_key=SESSION_SECRET)
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "adamhill")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "Adamhillonline1!")
 
+# For VPS safety right now we force dummy mode on.
+# When you're ready for live, change to:
+#   USE_DUMMY = os.getenv("BETFAIR_DUMMY", "false").lower() == "true"
 USE_DUMMY = True
 
 # --------------------------------------------------------
@@ -79,96 +81,46 @@ def render_login_page(error: str = "") -> HTMLResponse:
         <title>Betfair Bot Login</title>
         <meta name="viewport" content="width=device-width, initial-scale=1" />
         <style>
-            * {{ box-sizing: border-box; }}
             body {{
+                font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+                background: #020617;
+                color: #e5e7eb;
                 margin: 0;
                 padding: 0;
-                font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-                background: radial-gradient(circle at top, #1f2933, #020617 55%);
-                color: #e5e7eb;
-                min-height: 100vh;
-                display: flex;
-                align-items: center;
-                justify-content: center;
             }}
-            .shell {{
-                width: 100%;
-                padding: 16px;
-            }}
-            .card {{
+            .container {{
                 max-width: 380px;
-                margin: 0 auto;
-                padding: 22px 20px 18px 20px;
-                background: rgba(15, 23, 42, 0.96);
-                border-radius: 20px;
-                border: 1px solid rgba(148, 163, 184, 0.25);
-                box-shadow:
-                    0 22px 45px rgba(0, 0, 0, 0.7),
-                    0 0 0 1px rgba(15, 23, 42, 0.8);
-                backdrop-filter: blur(12px);
-            }}
-            .logo-row {{
-                display: flex;
-                align-items: center;
-                justify-content: center;
-                gap: 10px;
-                margin-bottom: 4px;
-            }}
-            .logo-pill {{
-                width: 32px;
-                height: 32px;
-                border-radius: 999px;
-                background: radial-gradient(circle at 30% 10%, #22c55e, #15803d);
-                display: flex;
-                align-items: center;
-                justify-content: center;
-                font-size: 0.9rem;
-                font-weight: 700;
-                color: white;
-                box-shadow: 0 0 16px rgba(34, 197, 94, 0.7);
+                margin: 80px auto;
+                padding: 24px;
+                background: #020617;
+                border-radius: 16px;
+                border: 1px solid #1f2937;
+                box-shadow: 0 20px 25px -5px rgba(0,0,0,0.5);
             }}
             h1 {{
-                margin: 0;
+                margin-top: 0;
                 text-align: center;
-                font-size: 1.3rem;
-                letter-spacing: 0.03em;
-            }}
-            .subtitle {{
-                margin-top: 4px;
-                text-align: center;
-                font-size: 0.8rem;
-                color: #9ca3af;
-            }}
-            form {{
-                margin-top: 16px;
+                font-size: 1.5rem;
             }}
             label {{
                 display: block;
-                font-size: 0.8rem;
+                font-size: 0.85rem;
                 margin-bottom: 4px;
                 color: #9ca3af;
-            }}
-            .field {{
-                margin-bottom: 10px;
             }}
             input[type="text"], input[type="password"] {{
                 width: 100%;
                 padding: 8px 10px;
-                border-radius: 10px;
+                margin-bottom: 10px;
+                border-radius: 8px;
                 border: 1px solid #374151;
                 background: #020617;
                 color: #e5e7eb;
                 font-size: 0.9rem;
-                outline: none;
-            }}
-            input[type="text"]:focus, input[type="password"]:focus {{
-                border-color: #22c55e;
-                box-shadow: 0 0 0 1px rgba(34, 197, 94, 0.4);
             }}
             button {{
                 width: 100%;
                 padding: 9px;
-                margin-top: 4px;
                 border-radius: 999px;
                 border: none;
                 cursor: pointer;
@@ -176,11 +128,9 @@ def render_login_page(error: str = "") -> HTMLResponse:
                 color: white;
                 font-weight: 600;
                 font-size: 0.95rem;
-                letter-spacing: 0.03em;
-                text-transform: uppercase;
             }}
             button:hover {{
-                filter: brightness(1.05);
+                opacity: 0.9;
             }}
             .error {{
                 color: #f97316;
@@ -188,40 +138,21 @@ def render_login_page(error: str = "") -> HTMLResponse:
                 margin-bottom: 8px;
                 text-align: center;
             }}
-            .footnote {{
-                margin-top: 12px;
-                text-align: center;
-                font-size: 0.75rem;
-                color: #6b7280;
-            }}
         </style>
     </head>
     <body>
-        <div class="shell">
-            <div class="card">
-                <div class="logo-row">
-                    <div class="logo-pill">BF</div>
-                    <div style="text-align:left;">
-                        <h1>Betfair Favs Bot</h1>
-                        <div class="subtitle">2-favourite dutching controller</div>
-                    </div>
-                </div>
-                {"<div class='error'>" + error + "</div>" if error else ""}
-                <form method="POST" action="/login">
-                    <div class="field">
-                        <label for="username">Username</label>
-                        <input type="text" name="username" id="username" autocomplete="username" />
-                    </div>
-                    <div class="field">
-                        <label for="password">Password</label>
-                        <input type="password" name="password" id="password" autocomplete="current-password" />
-                    </div>
-                    <button type="submit">Log In</button>
-                </form>
-                <div class="footnote">
-                    VPS: UK • Mode: dashboard only (bets handled on Betfair)
-                </div>
-            </div>
+        <div class="container">
+            <h1>Betfair Bot Login</h1>
+            {"<div class='error'>" + error + "</div>" if error else ""}
+            <form method="POST" action="/login">
+                <label for="username">Username</label>
+                <input type="text" name="username" id="username" />
+
+                <label for="password">Password</label>
+                <input type="password" name="password" id="password" />
+
+                <button type="submit">Log In</button>
+            </form>
         </div>
     </body>
     </html>
@@ -261,7 +192,7 @@ def render_dashboard(message: str = "") -> HTMLResponse:
 
     selected_ids = set(getattr(state, "selected_markets", []))
 
-    # 🔥 NOTE: this MUST be an f-string (f"""...""") so {bank:.2f}, {day_pl:.2f}, etc get filled in
+    # IMPORTANT: this is an f-string so {bank:.2f}, etc are interpolated.
     html = f"""
     <html>
     <head>
@@ -541,7 +472,6 @@ def render_dashboard(message: str = "") -> HTMLResponse:
                                     border:1px solid #1f2937; padding:8px;">
     """
 
-    # Race checkboxes
     for m in markets:
         mid = m["market_id"]
         name = m["name"]
@@ -759,7 +689,7 @@ async def start_bot(request: Request):
     if redirect:
         return redirect
 
-    if not state.selected_markets:
+    if not getattr(state, "selected_markets", []):
         return render_dashboard("No races selected – tick at least one race and save.")
 
     try:
@@ -831,10 +761,10 @@ async def inspect_hurdles(request: Request):
     html_parts.append("<html><head><title>Inspect Hurdles</title></head><body>")
     html_parts.append(f"<h2>Horse markets for today (UTC date = {today_utc})</h2>")
     html_parts.append("<p>This debug view shows exactly how Betfair names today's horse races.</p>")
-    html_parts.append("<p><a href='/'>Back to dashboard</a></p>")
+    html_parts.append("<p><a href='/'>⬅ Back to dashboard</a></p>")
 
     if client.use_dummy:
-        html_parts.append("<p style='color:orange;'>Client is in DUMMY mode - switch to live to see real markets.</p>")
+        html_parts.append("<p style='color:orange;'>Client is in DUMMY mode – switch to live to see real markets.</p>")
         html_parts.append("</body></html>")
         return HTMLResponse("".join(html_parts))
 
@@ -864,7 +794,6 @@ async def inspect_hurdles(request: Request):
         venue = event.get("venue", "")
         open_date_str = event.get("openDate", "")
 
-        # Parse date -> filter to today (UTC)
         event_date = None
         if open_date_str:
             try:
@@ -898,8 +827,8 @@ async def inspect_hurdles(request: Request):
 
     html_parts.append(f"<p>Showing <strong>{idx_today}</strong> horse markets whose event date is today (UTC).</p>")
     html_parts.append("""
-        <table border="1" cellspacing="0" cellpadding="4" style="font-size:0.8rem;">
-            <tr>
+        <table border="1" cellspacing="0" cellpadding="4" style="font-size:0.8rem;border-color:#1f2937;">
+            <tr style="background:#111827;color:#e5e7eb;">
                 <th>#</th>
                 <th>Tags</th>
                 <th>MarketId</th>
@@ -919,67 +848,6 @@ async def inspect_hurdles(request: Request):
                 <td>{event_name}</td>
                 <td>{venue}</td>
                 <td>{market_name}</td>
-            </tr>
-        """)
-
-    html_parts.append("</table></body></html>")
-    return HTMLResponse("".join(html_parts))
-
-
-# --------------------------------------------------------
-# Debug route: inspect available event types from Betfair
-# --------------------------------------------------------
-
-@app.get("/inspect_event_types", response_class=HTMLResponse)
-async def inspect_event_types(request: Request):
-    redirect = require_login(request)
-    if redirect:
-        return redirect
-
-    html_parts = []
-    html_parts.append("<html><head><title>Inspect Event Types</title></head><body>")
-    html_parts.append("<h2>Betfair Event Types (what your account can see)</h2>")
-    html_parts.append("<p><a href='/'>Back to dashboard</a></p>")
-
-    if client.use_dummy:
-        html_parts.append(
-            "<p style='color:orange;'>Client is in DUMMY mode - switch to live mode to see real data.</p>"
-        )
-        html_parts.append("</body></html>")
-        return HTMLResponse("".join(html_parts))
-
-    params = {"filter": {}}
-
-    try:
-        result = client._rpc("listEventTypes", params)
-    except Exception as e:
-        html_parts.append(f"<p style='color:red;'>Error calling listEventTypes: {e}</p>")
-        html_parts.append("</body></html>")
-        return HTMLResponse("".join(html_parts))
-
-    html_parts.append(f"<p>Betfair returned {len(result)} event types.</p>")
-    html_parts.append("""
-        <table border="1" cellspacing="0" cellpadding="4" style="font-size:0.8rem;">
-            <tr>
-                <th>#</th>
-                <th>EventTypeId</th>
-                <th>Name</th>
-                <th>MarketCount</th>
-            </tr>
-    """)
-
-    for idx, item in enumerate(result, 1):
-        et = item.get("eventType", {}) or {}
-        et_id = et.get("id", "?")
-        et_name = et.get("name", "?")
-        market_count = item.get("marketCount", 0)
-
-        html_parts.append(f"""
-            <tr>
-                <td>{idx}</td>
-                <td>{et_id}</td>
-                <td>{et_name}</td>
-                <td>{market_count}</td>
             </tr>
         """)
 
