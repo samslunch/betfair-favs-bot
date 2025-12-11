@@ -34,6 +34,7 @@ from strategy import StrategyState, ProgressionStrategy
 ADMIN_USERNAME = "adamhill"
 ADMIN_PASSWORD = "Adamhillonline1!"
 SECRET_KEY = "super-secret-local-key-change-me-later"
+USE_DUMMY = True
 
 
 # ======================
