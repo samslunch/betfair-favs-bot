@@ -79,46 +79,96 @@ def render_login_page(error: str = "") -> HTMLResponse:
         <title>Betfair Bot Login</title>
         <meta name="viewport" content="width=device-width, initial-scale=1" />
         <style>
+            * {{ box-sizing: border-box; }}
             body {{
-                font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-                background: #020617;
-                color: #e5e7eb;
                 margin: 0;
                 padding: 0;
+                font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+                background: radial-gradient(circle at top, #1f2933, #020617 55%);
+                color: #e5e7eb;
+                min-height: 100vh;
+                display: flex;
+                align-items: center;
+                justify-content: center;
             }}
-            .container {{
+            .shell {{
+                width: 100%;
+                padding: 16px;
+            }}
+            .card {{
                 max-width: 380px;
-                margin: 80px auto;
-                padding: 24px;
-                background: #020617;
-                border-radius: 16px;
-                border: 1px solid #1f2937;
-                box-shadow: 0 20px 25px -5px rgba(0,0,0,0.5);
+                margin: 0 auto;
+                padding: 22px 20px 18px 20px;
+                background: rgba(15, 23, 42, 0.96);
+                border-radius: 20px;
+                border: 1px solid rgba(148, 163, 184, 0.25);
+                box-shadow:
+                    0 22px 45px rgba(0, 0, 0, 0.7),
+                    0 0 0 1px rgba(15, 23, 42, 0.8);
+                backdrop-filter: blur(12px);
+            }}
+            .logo-row {{
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                gap: 10px;
+                margin-bottom: 4px;
+            }}
+            .logo-pill {{
+                width: 32px;
+                height: 32px;
+                border-radius: 999px;
+                background: radial-gradient(circle at 30% 10%, #22c55e, #15803d);
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                font-size: 0.9rem;
+                font-weight: 700;
+                color: white;
+                box-shadow: 0 0 16px rgba(34, 197, 94, 0.7);
             }}
             h1 {{
-                margin-top: 0;
+                margin: 0;
                 text-align: center;
-                font-size: 1.5rem;
+                font-size: 1.3rem;
+                letter-spacing: 0.03em;
+            }}
+            .subtitle {{
+                margin-top: 4px;
+                text-align: center;
+                font-size: 0.8rem;
+                color: #9ca3af;
+            }}
+            form {{
+                margin-top: 16px;
             }}
             label {{
                 display: block;
-                font-size: 0.85rem;
+                font-size: 0.8rem;
                 margin-bottom: 4px;
                 color: #9ca3af;
+            }}
+            .field {{
+                margin-bottom: 10px;
             }}
             input[type="text"], input[type="password"] {{
                 width: 100%;
                 padding: 8px 10px;
-                margin-bottom: 10px;
-                border-radius: 8px;
+                border-radius: 10px;
                 border: 1px solid #374151;
                 background: #020617;
                 color: #e5e7eb;
                 font-size: 0.9rem;
+                outline: none;
+            }}
+            input[type="text"]:focus, input[type="password"]:focus {{
+                border-color: #22c55e;
+                box-shadow: 0 0 0 1px rgba(34, 197, 94, 0.4);
             }}
             button {{
                 width: 100%;
                 padding: 9px;
+                margin-top: 4px;
                 border-radius: 999px;
                 border: none;
                 cursor: pointer;
@@ -126,9 +176,11 @@ def render_login_page(error: str = "") -> HTMLResponse:
                 color: white;
                 font-weight: 600;
                 font-size: 0.95rem;
+                letter-spacing: 0.03em;
+                text-transform: uppercase;
             }}
             button:hover {{
-                opacity: 0.9;
+                filter: brightness(1.05);
             }}
             .error {{
                 color: #f97316;
@@ -136,21 +188,40 @@ def render_login_page(error: str = "") -> HTMLResponse:
                 margin-bottom: 8px;
                 text-align: center;
             }}
+            .footnote {{
+                margin-top: 12px;
+                text-align: center;
+                font-size: 0.75rem;
+                color: #6b7280;
+            }}
         </style>
     </head>
     <body>
-        <div class="container">
-            <h1>Betfair Bot Login</h1>
-            {"<div class='error'>" + error + "</div>" if error else ""}
-            <form method="POST" action="/login">
-                <label for="username">Username</label>
-                <input type="text" name="username" id="username" />
-
-                <label for="password">Password</label>
-                <input type="password" name="password" id="password" />
-
-                <button type="submit">Log In</button>
-            </form>
+        <div class="shell">
+            <div class="card">
+                <div class="logo-row">
+                    <div class="logo-pill">BF</div>
+                    <div style="text-align:left;">
+                        <h1>Betfair Favs Bot</h1>
+                        <div class="subtitle">2-favourite dutching controller</div>
+                    </div>
+                </div>
+                {"<div class='error'>" + error + "</div>" if error else ""}
+                <form method="POST" action="/login">
+                    <div class="field">
+                        <label for="username">Username</label>
+                        <input type="text" name="username" id="username" autocomplete="username" />
+                    </div>
+                    <div class="field">
+                        <label for="password">Password</label>
+                        <input type="password" name="password" id="password" autocomplete="current-password" />
+                    </div>
+                    <button type="submit">Log In</button>
+                </form>
+                <div class="footnote">
+                    VPS: UK • Mode: dashboard only (bets handled on Betfair)
+                </div>
+            </div>
         </div>
     </body>
     </html>
@@ -200,7 +271,7 @@ def render_dashboard(message: str = "") -> HTMLResponse:
             body {{
                 margin: 0;
                 font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-                background: #020617;
+                background: radial-gradient(circle at top, #020617 0, #020617 40%, #020617 100%);
                 color: #e5e7eb;
             }}
             a {{
@@ -211,63 +282,95 @@ def render_dashboard(message: str = "") -> HTMLResponse:
             .page {{
                 max-width: 1200px;
                 margin: 0 auto;
-                padding: 14px;
+                padding: 12px 12px 18px 12px;
             }}
             .top-bar {{
                 display: flex;
                 justify-content: space-between;
                 align-items: center;
-                gap: 8px;
+                gap: 10px;
+                padding: 8px 10px;
+                border-radius: 16px;
+                border: 1px solid #1f2937;
+                background: linear-gradient(135deg, rgba(15,23,42,0.96), rgba(15,23,42,0.92));
+                box-shadow: 0 18px 35px rgba(0,0,0,0.6);
                 margin-bottom: 12px;
             }}
-            @media (max-width: 700px) {{
+            @media (max-width: 800px) {{
                 .top-bar {{
                     flex-direction: column;
                     align-items: flex-start;
                 }}
             }}
+            .brand {{
+                display: flex;
+                align-items: center;
+                gap: 10px;
+            }}
+            .brand-pill {{
+                width: 32px;
+                height: 32px;
+                border-radius: 999px;
+                background: radial-gradient(circle at 30% 10%, #22c55e, #15803d);
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                font-size: 0.9rem;
+                font-weight: 700;
+                color: white;
+                box-shadow: 0 0 16px rgba(34, 197, 94, 0.7);
+            }}
             h1 {{
                 margin: 0;
-                font-size: 1.4rem;
+                font-size: 1.25rem;
             }}
             .sub {{
                 font-size: 0.8rem;
                 color: #9ca3af;
             }}
+            .status-block {{
+                text-align: right;
+            }}
+            @media (max-width: 800px) {{
+                .status-block {{
+                    text-align: left;
+                    width: 100%;
+                }}
+            }}
             .pill {{
                 border-radius: 999px;
-                padding: 3px 8px;
+                padding: 4px 9px;
                 font-size: 0.75rem;
                 display: inline-flex;
                 align-items: center;
-                gap: 4px;
+                gap: 6px;
             }}
             .pill.green {{
                 background: rgba(34,197,94,0.1);
-                border: 1px solid rgba(34,197,94,0.3);
+                border: 1px solid rgba(34,197,94,0.35);
                 color: #4ade80;
             }}
             .pill.red {{
                 background: rgba(248,113,113,0.1);
-                border: 1px solid rgba(248,113,113,0.3);
+                border: 1px solid rgba(248,113,113,0.35);
                 color: #fca5a5;
             }}
             .grid {{
                 display: grid;
-                grid-template-columns: 1.1fr 1fr;
-                gap: 14px;
+                grid-template-columns: minmax(0, 1.1fr) minmax(0, 0.95fr);
+                gap: 12px;
             }}
-            @media (max-width: 900px) {{
+            @media (max-width: 960px) {{
                 .grid {{
-                    grid-template-columns: 1fr;
+                    grid-template-columns: minmax(0, 1fr);
                 }}
             }}
             .card {{
-                background: #020617;
-                border-radius: 16px;
+                background: rgba(15, 23, 42, 0.98);
+                border-radius: 18px;
                 border: 1px solid #1f2937;
                 padding: 12px 14px;
-                box-shadow: 0 20px 25px -5px rgba(0,0,0,0.4);
+                box-shadow: 0 20px 40px rgba(0,0,0,0.5);
             }}
             .card h2 {{
                 margin: 0 0 8px 0;
@@ -286,11 +389,16 @@ def render_dashboard(message: str = "") -> HTMLResponse:
             input[type="number"], input[type="text"] {{
                 width: 100%;
                 padding: 6px 8px;
-                border-radius: 8px;
+                border-radius: 9px;
                 border: 1px solid #374151;
                 background: #020617;
                 color: #e5e7eb;
                 font-size: 0.85rem;
+                outline: none;
+            }}
+            input[type="number"]:focus, input[type="text"]:focus {{
+                border-color: #22c55e;
+                box-shadow: 0 0 0 1px rgba(34,197,94,0.4);
             }}
             .row {{
                 display: flex;
@@ -317,7 +425,7 @@ def render_dashboard(message: str = "") -> HTMLResponse:
                 color: white;
             }}
             .btn-secondary {{
-                background: #0f172a;
+                background: #020617;
                 color: #e5e7eb;
                 border: 1px solid #374151;
             }}
@@ -333,6 +441,10 @@ def render_dashboard(message: str = "") -> HTMLResponse:
                 font-size: 0.8rem;
                 color: #f97316;
                 margin-bottom: 6px;
+                padding: 6px 10px;
+                border-radius: 10px;
+                border: 1px solid rgba(248, 148, 64, 0.3);
+                background: rgba(30, 64, 175, 0.12);
             }}
             .green-text {{ color: #4ade80; }}
             .red-text {{ color: #fca5a5; }}
@@ -352,27 +464,37 @@ def render_dashboard(message: str = "") -> HTMLResponse:
             .history-table tr:last-child td {{
                 border-bottom: none;
             }}
+            .section-label {{
+                font-size: 0.8rem;
+                color: #9ca3af;
+                margin-bottom: 4px;
+            }}
         </style>
     </head>
     <body>
         <div class="page">
             <div class="top-bar">
-                <div>
-                    <h1>Betfair 2-Fav Dutching Bot</h1>
-                    <div class="sub">
-                        Logged in as <strong>{ADMIN_USERNAME}</strong> |
-                        <a href="/logout">Log out</a> |
-                        <a href="/inspect_hurdles">Inspect Hurdles</a> |
-                        <a href="/inspect_event_types">Inspect Event Types</a>
+                <div class="brand">
+                    <div class="brand-pill">BF</div>
+                    <div>
+                        <h1>Betfair 2-Fav Dutching Bot</h1>
+                        <div class="sub">
+                            Logged in as <strong>{ADMIN_USERNAME}</strong> ·
+                            <a href="/logout">Log out</a> ·
+                            <a href="/inspect_hurdles">Inspect Hurdles</a>
+                        </div>
                     </div>
                 </div>
-                <div style="text-align:right;">
+                <div class="status-block">
                     <div class="pill {'green' if running else 'red'}">
                         <span style="font-size:0.65rem;">●</span>
                         {"Running" if running else "Stopped"}
                     </div><br/>
                     <span class="sub">
-                        Mode: {"DUMMY" if USE_DUMMY else "LIVE READ-ONLY (no bets placed)"}
+                        Mode: {"DUMMY (no real bets)" if USE_DUMMY else "LIVE READ-ONLY"}
+                    </span><br/>
+                    <span class="sub">
+                        Server time: {dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M")} UTC
                     </span>
                 </div>
             </div>
@@ -433,7 +555,7 @@ def render_dashboard(message: str = "") -> HTMLResponse:
                         </div>
 
                         <div style="margin-top:10px;">
-                            <span class="sub">Quick stake profiles (% of bank):</span><br/>
+                            <span class="section-label">Quick stake profiles (% of bank):</span><br/>
                             <button class="btn btn-secondary btn-small" name="profile" value="2">2%</button>
                             <button class="btn btn-secondary btn-small" name="profile" value="5">5%</button>
                             <button class="btn btn-secondary btn-small" name="profile" value="10">10%</button>
@@ -460,17 +582,16 @@ def render_dashboard(message: str = "") -> HTMLResponse:
     if not markets:
         html += """
                     <p style="color:#f97316;font-size:0.8rem;">
-                        No markets returned by Betfair. Check API / filters.
+                        No markets returned by Betfair. Check API / filters (dummy may return test races only).
                     </p>
         """
 
     html += """
                     <form method="POST" action="/update_race_selection">
-                        <div style="max-height:260px; overflow-y:auto; border-radius:8px;
-                                    border:1px solid #1f2937; padding:8px;">
+                        <div style="max-height:260px; overflow-y:auto; border-radius:10px;
+                                    border:1px solid #1f2937; padding:8px; background:#020617;">
     """
 
-    # Race checkboxes
     for m in markets:
         mid = m["market_id"]
         name = m["name"]
@@ -495,7 +616,7 @@ def render_dashboard(message: str = "") -> HTMLResponse:
                 <!-- RIGHT: status, controls, history -->
                 <div class="card">
                     <h2>Status & Controls</h2>
-                    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+                    <div style="display:flex;flex-wrap:wrap;gap:12px;justify-content:space-between;align-items:flex-end;margin-bottom:8px;">
                         <div>
                             <div class="sub">Current bank</div>
                             <div style="font-size:1.2rem;">£{bank:.2f}</div>
@@ -514,15 +635,15 @@ def render_dashboard(message: str = "") -> HTMLResponse:
                         </div>
                     </div>
 
-                    <form method="POST" action="/start">
+                    <form method="POST" action="/start" style="display:inline;">
                         <button type="submit" class="btn btn-primary">▶ Start Bot</button>
                     </form>
-                    <form method="POST" action="/stop" style="margin-top:6px;">
+                    <form method="POST" action="/stop" style="display:inline;margin-left:6px;">
                         <button type="submit" class="btn btn-danger">■ Stop Bot</button>
                     </form>
 
                     <div style="margin-top:12px;">
-                        <span class="sub">Manual race outcome (until auto-result is wired in):</span><br/>
+                        <span class="section-label">Manual race outcome (until auto-result is wired in):</span><br/>
                         <form method="POST" action="/race_won" style="display:inline;">
                             <button type="submit" class="btn btn-secondary btn-small">Race WON</button>
                         </form>
@@ -575,8 +696,8 @@ def render_dashboard(message: str = "") -> HTMLResponse:
     </body>
     </html>
     """
-
     return HTMLResponse(html)
+
 
 
 # --------------------------------------------------------
