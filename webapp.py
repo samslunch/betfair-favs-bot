@@ -261,6 +261,7 @@ def render_dashboard(message: str = "") -> HTMLResponse:
 
     selected_ids = set(getattr(state, "selected_markets", []))
 
+    # 🔥 NOTE: this MUST be an f-string (f"""...""") so {bank:.2f}, {day_pl:.2f}, etc get filled in
     html = f"""
     <html>
     <head>
@@ -271,7 +272,7 @@ def render_dashboard(message: str = "") -> HTMLResponse:
             body {{
                 margin: 0;
                 font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-                background: radial-gradient(circle at top, #020617 0, #020617 40%, #020617 100%);
+                background: #020617;
                 color: #e5e7eb;
             }}
             a {{
@@ -282,95 +283,63 @@ def render_dashboard(message: str = "") -> HTMLResponse:
             .page {{
                 max-width: 1200px;
                 margin: 0 auto;
-                padding: 12px 12px 18px 12px;
+                padding: 14px;
             }}
             .top-bar {{
                 display: flex;
                 justify-content: space-between;
                 align-items: center;
-                gap: 10px;
-                padding: 8px 10px;
-                border-radius: 16px;
-                border: 1px solid #1f2937;
-                background: linear-gradient(135deg, rgba(15,23,42,0.96), rgba(15,23,42,0.92));
-                box-shadow: 0 18px 35px rgba(0,0,0,0.6);
+                gap: 8px;
                 margin-bottom: 12px;
             }}
-            @media (max-width: 800px) {{
+            @media (max-width: 700px) {{
                 .top-bar {{
                     flex-direction: column;
                     align-items: flex-start;
                 }}
             }}
-            .brand {{
-                display: flex;
-                align-items: center;
-                gap: 10px;
-            }}
-            .brand-pill {{
-                width: 32px;
-                height: 32px;
-                border-radius: 999px;
-                background: radial-gradient(circle at 30% 10%, #22c55e, #15803d);
-                display: flex;
-                align-items: center;
-                justify-content: center;
-                font-size: 0.9rem;
-                font-weight: 700;
-                color: white;
-                box-shadow: 0 0 16px rgba(34, 197, 94, 0.7);
-            }}
             h1 {{
                 margin: 0;
-                font-size: 1.25rem;
+                font-size: 1.4rem;
             }}
             .sub {{
                 font-size: 0.8rem;
                 color: #9ca3af;
             }}
-            .status-block {{
-                text-align: right;
-            }}
-            @media (max-width: 800px) {{
-                .status-block {{
-                    text-align: left;
-                    width: 100%;
-                }}
-            }}
             .pill {{
                 border-radius: 999px;
-                padding: 4px 9px;
+                padding: 3px 8px;
                 font-size: 0.75rem;
                 display: inline-flex;
                 align-items: center;
-                gap: 6px;
+                gap: 4px;
             }}
             .pill.green {{
                 background: rgba(34,197,94,0.1);
-                border: 1px solid rgba(34,197,94,0.35);
+                border: 1px solid rgba(34,197,94,0.3);
                 color: #4ade80;
             }}
             .pill.red {{
                 background: rgba(248,113,113,0.1);
-                border: 1px solid rgba(248,113,113,0.35);
+                border: 1px solid rgba(248,113,113,0.3);
                 color: #fca5a5;
             }}
             .grid {{
                 display: grid;
-                grid-template-columns: minmax(0, 1.1fr) minmax(0, 0.95fr);
-                gap: 12px;
+                grid-template-columns: 1.1fr 1fr;
+                gap: 14px;
             }}
-            @media (max-width: 960px) {{
+            @media (max-width: 900px) {{
                 .grid {{
-                    grid-template-columns: minmax(0, 1fr);
+                    grid-template-columns: 1fr;
                 }}
             }}
             .card {{
-                background: rgba(15, 23, 42, 0.98);
-                border-radius: 18px;
+                background: #020617;
+                border-radius: 16px;
                 border: 1px solid #1f2937;
                 padding: 12px 14px;
-                box-shadow: 0 20px 40px rgba(0,0,0,0.5);
+                box-shadow: 0 20px 25px -5px rgba(0,0,0,0.4);
             }}
             .card h2 {{
                 margin: 0 0 8px 0;
@@ -389,16 +358,11 @@ def render_dashboard(message: str = "") -> HTMLResponse:
             input[type="number"], input[type="text"] {{
                 width: 100%;
                 padding: 6px 8px;
-                border-radius: 9px;
+                border-radius: 8px;
                 border: 1px solid #374151;
                 background: #020617;
                 color: #e5e7eb;
                 font-size: 0.85rem;
-                outline: none;
-            }}
-            input[type="number"]:focus, input[type="text"]:focus {{
-                border-color: #22c55e;
-                box-shadow: 0 0 0 1px rgba(34,197,94,0.4);
             }}
             .row {{
                 display: flex;
@@ -425,7 +389,7 @@ def render_dashboard(message: str = "") -> HTMLResponse:
                 color: white;
             }}
             .btn-secondary {{
-                background: #020617;
+                background: #0f172a;
                 color: #e5e7eb;
                 border: 1px solid #374151;
             }}
@@ -441,10 +405,6 @@ def render_dashboard(message: str = "") -> HTMLResponse:
                 font-size: 0.8rem;
                 color: #f97316;
                 margin-bottom: 6px;
-                padding: 6px 10px;
-                border-radius: 10px;
-                border: 1px solid rgba(248, 148, 64, 0.3);
-                background: rgba(30, 64, 175, 0.12);
             }}
             .green-text {{ color: #4ade80; }}
             .red-text {{ color: #fca5a5; }}
@@ -464,37 +424,26 @@ def render_dashboard(message: str = "") -> HTMLResponse:
             .history-table tr:last-child td {{
                 border-bottom: none;
             }}
-            .section-label {{
-                font-size: 0.8rem;
-                color: #9ca3af;
-                margin-bottom: 4px;
-            }}
         </style>
     </head>
     <body>
         <div class="page">
             <div class="top-bar">
-                <div class="brand">
-                    <div class="brand-pill">BF</div>
-                    <div>
-                        <h1>Betfair 2-Fav Dutching Bot</h1>
-                        <div class="sub">
-                            Logged in as <strong>{ADMIN_USERNAME}</strong> ·
-                            <a href="/logout">Log out</a> ·
-                            <a href="/inspect_hurdles">Inspect Hurdles</a>
-                        </div>
+                <div>
+                    <h1>Betfair 2-Fav Dutching Bot</h1>
+                    <div class="sub">
+                        Logged in as <strong>{ADMIN_USERNAME}</strong> |
+                        <a href="/logout">Log out</a> |
+                        <a href="/inspect_hurdles">Inspect Hurdles</a>
                     </div>
                 </div>
-                <div class="status-block">
+                <div style="text-align:right;">
                     <div class="pill {'green' if running else 'red'}">
                         <span style="font-size:0.65rem;">●</span>
                         {"Running" if running else "Stopped"}
                     </div><br/>
                     <span class="sub">
-                        Mode: {"DUMMY (no real bets)" if USE_DUMMY else "LIVE READ-ONLY"}
-                    </span><br/>
-                    <span class="sub">
-                        Server time: {dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M")} UTC
+                        Mode: {"DUMMY" if USE_DUMMY else "LIVE READ-ONLY (no bets placed)"}
                     </span>
                 </div>
             </div>
@@ -555,7 +504,7 @@ def render_dashboard(message: str = "") -> HTMLResponse:
                         </div>
 
                         <div style="margin-top:10px;">
-                            <span class="section-label">Quick stake profiles (% of bank):</span><br/>
+                            <span class="sub">Quick stake profiles (% of bank):</span><br/>
                             <button class="btn btn-secondary btn-small" name="profile" value="2">2%</button>
                             <button class="btn btn-secondary btn-small" name="profile" value="5">5%</button>
                             <button class="btn btn-secondary btn-small" name="profile" value="10">10%</button>
@@ -582,16 +531,17 @@ def render_dashboard(message: str = "") -> HTMLResponse:
     if not markets:
         html += """
                     <p style="color:#f97316;font-size:0.8rem;">
-                        No markets returned by Betfair. Check API / filters (dummy may return test races only).
+                        No markets returned by Betfair. Check API / filters.
                     </p>
         """
 
     html += """
                     <form method="POST" action="/update_race_selection">
-                        <div style="max-height:260px; overflow-y:auto; border-radius:10px;
-                                    border:1px solid #1f2937; padding:8px; background:#020617;">
+                        <div style="max-height:260px; overflow-y:auto; border-radius:8px;
+                                    border:1px solid #1f2937; padding:8px;">
     """
 
+    # Race checkboxes
     for m in markets:
         mid = m["market_id"]
         name = m["name"]
@@ -616,7 +566,7 @@ def render_dashboard(message: str = "") -> HTMLResponse:
                 <!-- RIGHT: status, controls, history -->
                 <div class="card">
                     <h2>Status & Controls</h2>
-                    <div style="display:flex;flex-wrap:wrap;gap:12px;justify-content:space-between;align-items:flex-end;margin-bottom:8px;">
+                    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
                         <div>
                             <div class="sub">Current bank</div>
                             <div style="font-size:1.2rem;">£{bank:.2f}</div>
@@ -635,15 +585,15 @@ def render_dashboard(message: str = "") -> HTMLResponse:
                         </div>
                     </div>
 
-                    <form method="POST" action="/start" style="display:inline;">
+                    <form method="POST" action="/start">
                         <button type="submit" class="btn btn-primary">▶ Start Bot</button>
                     </form>
-                    <form method="POST" action="/stop" style="display:inline;margin-left:6px;">
+                    <form method="POST" action="/stop" style="margin-top:6px;">
                         <button type="submit" class="btn btn-danger">■ Stop Bot</button>
                     </form>
 
                     <div style="margin-top:12px;">
-                        <span class="section-label">Manual race outcome (until auto-result is wired in):</span><br/>
+                        <span class="sub">Manual race outcome (until auto-result is wired in):</span><br/>
                         <form method="POST" action="/race_won" style="display:inline;">
                             <button type="submit" class="btn btn-secondary btn-small">Race WON</button>
                         </form>
@@ -696,8 +646,8 @@ def render_dashboard(message: str = "") -> HTMLResponse:
     </body>
     </html>
     """
-    return HTMLResponse(html)
 
+    return HTMLResponse(html)
 
 
 # --------------------------------------------------------
