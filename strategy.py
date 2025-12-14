@@ -1,67 +1,82 @@
 # strategy.py
 #
-# StrategyState + BotRunner for the Betfair 2-fav dutching bot.
+# StrategyState + BotRunner for 2-fav dutching bot.
 #
-# This version:
-#   - Keeps track of bank, target, odds limits, selected markets, etc.
-#   - Schedules each race: "seconds_before_off" before off time.
-#   - Fetches top 2 favourites and calculates dutching stakes (equal profit).
-#   - Does NOT place real bets (logging / UI only).
-#   - Lets the UI call race_won / race_lost to update bank and history.
+# Now includes:
+#   - Option B loss recovery (recoup losses until a win, then STOP)
+#   - Auto-result settlement (no manual won/lost buttons required)
+#   - Read-only mode by default (NO placeOrders) – logs "READY" only
+#
+# Requirements:
+#   betfair_client.BetfairClient must provide:
+#     - get_market_start_time(market_id) -> datetime
+#     - get_market_name(market_id) -> str
+#     - get_top_two_favourites(market_id) -> list of dicts containing:
+#         {"name": str, "back": float, "selection_id": int}  (selection_id strongly recommended)
+#     - get_market_result(market_id) -> dict like:
+#         {"status": "OPEN"/"SUSPENDED"/"CLOSED", "winner_selection_id": int|None, "runner_status": {selId: "WINNER"/...}}
+#
+# Dummy mode:
+#   - We simulate a result shortly after "READY" if BetfairClient.use_dummy is True.
 
 from __future__ import annotations
 
 import asyncio
 import datetime as dt
 from dataclasses import dataclass, field
-from typing import List, Optional, Deque, Dict, Any
-from collections import deque
+from typing import Optional, Any, Dict, List
 
 
 @dataclass
 class StrategyState:
-    # Bank & staking
+    # Bank settings
     starting_bank: float = 100.0
     bank: float = 100.0
-    target_profit: float = 5.0
-    stake_percent: float = 5.0  # % of bank per race
+    stake_percent: float = 5.0
 
-    # Odds filters
-    min_odds: float = 1.5
-    max_odds: float = 4.5
-
-    # Timing: when to place bets relative to off
-    seconds_before_off: int = 60
-
-    # Race sequence
+    # Selection / sequencing
     selected_markets: List[str] = field(default_factory=list)
     current_index: int = 0
-    running: bool = False
     current_market_id: Optional[str] = None
 
-    # For P/L and display
-    history: Deque[Dict[str, Any]] = field(default_factory=lambda: deque(maxlen=100))
+    # Timing
+    seconds_before_off: int = 60
+
+    # Odds filters
+    min_odds: float = 1.01
+    max_odds: float = 1000.0
+
+    # Runtime state
+    running: bool = False
+    history: List[Dict[str, Any]] = field(default_factory=list)
+
+    # Last bet preview
     last_total_stake: float = 0.0
     last_favourites: Optional[List[Dict[str, Any]]] = None
+    last_bet_time_utc: Optional[str] = None
+
+    # Option B: loss recovery
+    recovery_target: float = 0.0         # amount we want to recover
+    stop_after_win: bool = True          # Option B: stop after first win
+    max_recovery_stake_percent: float = 30.0  # cap stake as % of current bank (safety)
 
 
 class BotRunner:
     """
-    Simple async loop that:
-      - walks through state.selected_markets in order
+    Async loop:
+      - walks through state.selected_markets
       - waits until (off - seconds_before_off)
-      - fetches top 2 favourites & calculates dutching stakes
-      - waits for manual "Race WON/LOST" buttons to be pressed in the UI
+      - fetches top 2 favourites, calculates dutch stakes
+      - logs READY (no real bets placed)
+      - AFTER the off: polls Betfair for settlement and auto-records WON/LOST
+      - Option B: if lose, increase recovery_target; if win, STOP
     """
 
     def __init__(self, client, state: StrategyState):
         self.client = client
         self.state = state
         self._task: Optional[asyncio.Task] = None
-
-    # -------------------------
-    # Public control methods
-    # -------------------------
+        self._ready_at_monotonic: Optional[float] = None  # for dummy-mode simulation
 
     def start(self) -> None:
         if self.state.running:
@@ -72,11 +87,9 @@ class BotRunner:
             return
 
         self.state.running = True
-        # Reset index if we've run out
         if self.state.current_index >= len(self.state.selected_markets):
             self.state.current_index = 0
 
-        # Create a background task on the current event loop
         loop = asyncio.get_event_loop()
         self._task = loop.create_task(self._run_loop())
         print("[BOT] Loop started.")
@@ -85,22 +98,217 @@ class BotRunner:
         self.state.running = False
         if self._task and not self._task.done():
             self._task.cancel()
-        print("[BOT] Stop requested")
-
-    def mark_race_won(self) -> None:
-        self._record_result(won=True)
-
-    def mark_race_lost(self) -> None:
-        self._record_result(won=False)
+        print("[BOT] Stop requested.")
 
     # -------------------------
-    # Internal main loop
+    # Core helpers
+    # -------------------------
+
+    @staticmethod
+    def _dutch_calc(total_stake: float, o1: float, o2: float) -> Dict[str, float]:
+        inv_sum = (1.0 / o1) + (1.0 / o2)
+        if inv_sum <= 0:
+            return {"stake1": 0.0, "stake2": 0.0, "profit_each": -total_stake}
+
+        stake1 = total_stake * (1.0 / o1) / inv_sum
+        stake2 = total_stake - stake1
+        profit_each = total_stake / inv_sum - total_stake  # net profit if either wins (approx)
+        return {"stake1": stake1, "stake2": stake2, "profit_each": profit_each}
+
+    def _advance_market(self) -> None:
+        self.state.current_index += 1
+        self.state.current_market_id = None
+        self.state.last_favourites = None
+        self.state.last_total_stake = 0.0
+        self.state.last_bet_time_utc = None
+        self._ready_at_monotonic = None
+
+    def _compute_total_stake_for_recovery(self, o1: float, o2: float) -> float:
+        """
+        Option B stake sizing:
+          - base stake = bank * stake_percent
+          - if recovery_target > 0, try to size stake so that profit_each >= recovery_target
+          - cap stake to bank * max_recovery_stake_percent
+        """
+        bank = float(self.state.bank or 0.0)
+        if bank <= 0:
+            return 0.0
+
+        base = bank * (float(self.state.stake_percent or 0.0) / 100.0)
+
+        inv_sum = (1.0 / o1) + (1.0 / o2)
+        denom = (1.0 / inv_sum) - 1.0 if inv_sum > 0 else 0.0  # profit_each = stake * denom
+
+        desired_profit = max(0.0, float(self.state.recovery_target or 0.0))
+        required = 0.0
+        if desired_profit > 0 and denom > 0:
+            required = desired_profit / denom
+
+        total = max(base, required)
+
+        # Safety cap
+        cap = bank * (float(self.state.max_recovery_stake_percent or 0.0) / 100.0)
+        if cap > 0:
+            total = min(total, cap)
+
+        # Also never exceed bank
+        total = min(total, bank)
+
+        return float(total)
+
+    async def _sleep_chunked(self, seconds: float, chunk: float = 60.0) -> bool:
+        """
+        Sleep in chunks so stop() can interrupt.
+        Returns False if cancelled/should stop.
+        """
+        remaining = max(0.0, seconds)
+        while remaining > 0 and self.state.running:
+            s = min(chunk, remaining)
+            try:
+                await asyncio.sleep(s)
+            except asyncio.CancelledError:
+                return False
+            remaining -= s
+        return self.state.running
+
+    async def _wait_for_settlement_and_record(self, market_id: str, market_name: str) -> None:
+        """
+        Poll Betfair until market is CLOSED and winner known, then record result.
+        In dummy mode, simulate result a short time after READY.
+        """
+        # Small grace period after off
+        await self._sleep_chunked(10.0, chunk=10.0)
+        if not self.state.running or self.state.current_market_id != market_id:
+            return
+
+        favs = self.state.last_favourites or []
+        total_stake = float(self.state.last_total_stake or 0.0)
+
+        # Extract selection IDs best-effort
+        sel_ids: List[int] = []
+        for f in favs:
+            sid = f.get("selection_id")
+            if isinstance(sid, int):
+                sel_ids.append(sid)
+
+        # Dummy-mode simulation: settle after ~20 seconds from READY
+        if getattr(self.client, "use_dummy", False):
+            print("[BOT] Dummy mode: simulating settlement...")
+            await self._sleep_chunked(20.0, chunk=5.0)
+            if not self.state.running or self.state.current_market_id != market_id:
+                return
+            winner_is_fav = True  # deterministic: treat as win in dummy so you can see workflow
+            self._record_auto_result(market_name, market_id, won=winner_is_fav)
+            return
+
+        # Live: poll Betfair
+        for _ in range(360):  # up to ~1 hour if interval 10s
+            if not self.state.running or self.state.current_market_id != market_id:
+                return
+
+            try:
+                res = self.client.get_market_result(market_id)
+                status = (res or {}).get("status") or ""
+                status = str(status).upper()
+
+                winner_selection_id = (res or {}).get("winner_selection_id")
+                runner_status = (res or {}).get("runner_status") or {}
+
+                if status == "CLOSED":
+                    if isinstance(winner_selection_id, int):
+                        won = winner_selection_id in sel_ids if sel_ids else False
+                        self._record_auto_result(market_name, market_id, won=won)
+                        return
+
+                    # fallback: infer winner from runner statuses
+                    winner = None
+                    for sid_str, st in runner_status.items():
+                        try:
+                            sid_int = int(sid_str)
+                        except Exception:
+                            continue
+                        if str(st).upper() == "WINNER":
+                            winner = sid_int
+                            break
+
+                    if isinstance(winner, int):
+                        won = winner in sel_ids if sel_ids else False
+                        self._record_auto_result(market_name, market_id, won=won)
+                        return
+
+                    # CLOSED but no winner? wait a bit more
+                    print("[BOT] Market closed but winner not available yet; retrying...")
+            except Exception as e:
+                print("[BOT] Error checking settlement:", e)
+
+            await self._sleep_chunked(10.0, chunk=10.0)
+
+        print("[BOT] Settlement timeout; skipping market.")
+        self._advance_market()
+
+    def _record_auto_result(self, market_name: str, market_id: str, won: bool) -> None:
+        """
+        Update bank, history, recovery target, and advance/stop.
+        """
+        total_stake = float(self.state.last_total_stake or 0.0)
+        favs = self.state.last_favourites or []
+
+        if won:
+            o1 = float(favs[0]["back"])
+            o2 = float(favs[1]["back"])
+            profit_each = self._dutch_calc(total_stake, o1, o2)["profit_each"]
+            pl = float(profit_each)
+        else:
+            pl = -float(total_stake)
+
+        # Bank update
+        self.state.bank = float(self.state.bank or 0.0) + pl
+
+        # Recovery update (Option B)
+        if won:
+            # We attempted to size stake so profit >= recovery_target, so reset
+            self.state.recovery_target = 0.0
+        else:
+            # You lose the stake
+            self.state.recovery_target = float(self.state.recovery_target or 0.0) + float(total_stake)
+
+        entry = {
+            "ts_utc": dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+            "race_name": market_name,
+            "market_id": market_id,
+            "favs": (f"{favs[0].get('name','?')} / {favs[1].get('name','?')}") if len(favs) >= 2 else "",
+            "total_stake": total_stake,
+            "pl": pl,
+            "won": won,
+            "recovery_target_after": float(self.state.recovery_target or 0.0),
+            "bank_after": float(self.state.bank or 0.0),
+        }
+        self.state.history.append(entry)
+
+        print(
+            f"[BOT] RESULT: {market_name} => {'WON' if won else 'LOST'} | "
+            f"P/L £{pl:.2f} | bank £{self.state.bank:.2f} | "
+            f"recovery_target £{self.state.recovery_target:.2f}"
+        )
+
+        # Option B stop-after-win
+        if won and bool(self.state.stop_after_win):
+            print("[BOT] Option B: win achieved. Stopping bot.")
+            self.state.running = False
+            self._advance_market()
+            return
+
+        # Continue to next market
+        self._advance_market()
+
+    # -------------------------
+    # Main loop
     # -------------------------
 
     async def _run_loop(self) -> None:
         while self.state.running:
             if self.state.current_index >= len(self.state.selected_markets):
-                print("[STRATEGY] No markets selected – day done.")
+                print("[BOT] No more selected markets. Stopping.")
                 self.state.running = False
                 break
 
@@ -117,27 +325,23 @@ class BotRunner:
                 continue
 
             # Work in UTC
-            now = dt.datetime.utcnow().replace(tzinfo=dt.timezone.utc)
+            now = dt.datetime.now(dt.timezone.utc)
             if start_time.tzinfo is None:
                 start_time = start_time.replace(tzinfo=dt.timezone.utc)
             else:
                 start_time = start_time.astimezone(dt.timezone.utc)
 
-            # How long until we want to "act"?
             seconds_to_off = (start_time - now).total_seconds()
-            seconds_to_action = seconds_to_off - self.state.seconds_before_off
+            seconds_to_action = seconds_to_off - float(self.state.seconds_before_off or 60)
 
             if seconds_to_action > 0:
-                # Sleep in chunks so stop() can cut in
-                sleep_for = min(seconds_to_action, 60)
+                sleep_for = min(seconds_to_action, 60.0)
                 print(
                     f"[BOT] Waiting {sleep_for:.0f}s before checking prices for "
                     f"{market_name} ({market_id}). Off in {seconds_to_off:.0f}s."
                 )
-                try:
-                    await asyncio.sleep(sleep_for)
-                except asyncio.CancelledError:
-                    print("[BOT] Loop cancelled while waiting.")
+                ok = await self._sleep_chunked(sleep_for, chunk=60.0)
+                if not ok:
                     return
                 continue
 
@@ -150,105 +354,48 @@ class BotRunner:
                 continue
 
             if len(favs) < 2:
-                print("[BOT] Fewer than 2 runners with usable prices, skipping market.")
+                print("[BOT] Fewer than 2 runners with usable prices; skipping.")
                 self._advance_market()
                 continue
 
-            # Apply odds filters to top 2
-            favs_in_range = [
-                f for f in favs
-                if self.state.min_odds <= f["back"] <= self.state.max_odds
-            ]
+            # Odds range filter
+            favs_in_range = [f for f in favs if self.state.min_odds <= float(f["back"]) <= self.state.max_odds]
             if len(favs_in_range) < 2:
-                print("[BOT] Top 2 favourites out of odds range, skipping.")
+                print("[BOT] Top 2 favourites out of odds range; skipping.")
                 self._advance_market()
                 continue
 
-            total_stake = self.state.bank * (self.state.stake_percent / 100.0)
+            o1 = float(favs_in_range[0]["back"])
+            o2 = float(favs_in_range[1]["back"])
+
+            total_stake = self._compute_total_stake_for_recovery(o1, o2)
             if total_stake <= 0:
                 print("[BOT] Non-positive stake; stopping.")
                 self.state.running = False
                 break
 
-            o1 = favs_in_range[0]["back"]
-            o2 = favs_in_range[1]["back"]
-            inv_sum = (1.0 / o1) + (1.0 / o2)
-            stake1 = total_stake * (1.0 / o1) / inv_sum
-            stake2 = total_stake - stake1
+            calc = self._dutch_calc(total_stake, o1, o2)
+            stake1 = calc["stake1"]
+            stake2 = calc["stake2"]
+            profit_each = calc["profit_each"]
 
-            self.state.last_total_stake = total_stake
-            self.state.last_favourites = favs_in_range
+            self.state.last_total_stake = float(total_stake)
+            self.state.last_favourites = list(favs_in_range[:2])
+            self.state.last_bet_time_utc = dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+            self._ready_at_monotonic = asyncio.get_event_loop().time()
 
             print(
-                f"[BOT] READY: {market_name} ({market_id})\n"
-                f"      Stake total £{total_stake:.2f}\n"
+                f"[BOT] READY (NO REAL BETS PLACED): {market_name} ({market_id})\n"
+                f"      Recovery target £{self.state.recovery_target:.2f} | cap {self.state.max_recovery_stake_percent:.0f}% of bank\n"
+                f"      Stake total £{total_stake:.2f} | Projected profit if win £{profit_each:.2f}\n"
                 f"      £{stake1:.2f} on {favs_in_range[0]['name']} @ {o1}\n"
                 f"      £{stake2:.2f} on {favs_in_range[1]['name']} @ {o2}\n"
-                f"      {self.state.seconds_before_off}s before off. (NO REAL BETS PLACED)"
+                f"      {self.state.seconds_before_off}s before off."
             )
 
-            # Now wait here until the UI marks this race as WON/LOST or bot is stopped
-            try:
-                while (
-                    self.state.running
-                    and self.state.current_market_id == market_id
-                ):
-                    await asyncio.sleep(1.0)
-            except asyncio.CancelledError:
-                print("[BOT] Loop cancelled while waiting for race result.")
-                return
+            # Now auto-wait for settlement and record
+            await self._wait_for_settlement_and_record(market_id, market_name)
 
         print("[BOT] Loop finished.")
 
-    # -------------------------
-    # Helpers
-    # -------------------------
 
-    def _advance_market(self) -> None:
-        self.state.current_index += 1
-        self.state.current_market_id = None
-        self.state.last_favourites = None
-        self.state.last_total_stake = 0.0
-
-    def _record_result(self, won: bool) -> None:
-        market_id = self.state.current_market_id
-        if not market_id or not self.state.last_favourites:
-            print("[BOT] No active market to record result for.")
-            return
-
-        try:
-            race_name = self.client.get_market_name(market_id)
-        except Exception:
-            race_name = market_id
-
-        total_stake = self.state.last_total_stake
-        favs = self.state.last_favourites
-
-        if won:
-            # Approx equal-profit dutch based on back odds
-            o1 = favs[0]["back"]
-            o2 = favs[1]["back"]
-            inv_sum = (1.0 / o1) + (1.0 / o2)
-            profit_each = total_stake / inv_sum - total_stake
-            pl = profit_each
-        else:
-            pl = -total_stake
-
-        self.state.bank += pl
-
-        entry = {
-            "race_name": race_name,
-            "favs": f"{favs[0]['name']} / {favs[1]['name']}",
-            "total_stake": total_stake,
-            "pl": pl,
-            "won": won,
-        }
-        self.state.history.append(entry)
-
-        print(
-            f"[BOT] RESULT: {race_name} => {'WON' if won else 'LOST'} | "
-            f"P/L £{pl:.2f} | bank now £{self.state.bank:.2f}"
-        )
-
-        # Move on to the next race in sequence
-        self._advance_market()

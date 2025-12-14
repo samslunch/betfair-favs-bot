@@ -7,14 +7,13 @@
 #   - Settings: bank + stake % + quick profiles + seconds_before_off
 #   - Live Betfair balance (read-only)
 #   - Race selection: UK/IE novice hurdle-ish WIN markets
-#   - Bot control: Start / Stop
-#   - Auto result settlement (no manual won/lost buttons)
+#   - Bot control: Start / Stop / Race WON / Race LOST
 #   - Recent P/L history panel
 #   - Debug route: /inspect_hurdles
-#   - Live odds + projected winnings table (read-only) + auto-refresh
+#   - Live odds + projected winnings table (read-only)
 #   - Responsive mobile layout (no sideways scroll; tables scroll inside cards)
-#   - Countdown timer per race in UI (fetched via get_market_start_time)
-#   - UI Logs panel
+#   - Countdown timer per race in UI (now fetched via get_market_start_time)
+#   - UI Logs panel (so you don't need terminal)
 
 import os
 import datetime as dt
@@ -64,6 +63,7 @@ def setup_ui_logging() -> None:
     root = logging.getLogger()
     root.setLevel(logging.INFO)
 
+    # Avoid attaching multiple times
     for h in list(root.handlers):
         if isinstance(h, UILogHandler):
             return
@@ -186,8 +186,6 @@ def render_login_page(error: str = "") -> HTMLResponse:
 
 def _dutch_stakes(total_stake: float, o1: float, o2: float) -> Dict[str, float]:
     inv_sum = (1.0 / o1) + (1.0 / o2)
-    if inv_sum <= 0:
-        return {"stake1": 0.0, "stake2": 0.0, "profit_each": -total_stake}
     s1 = total_stake * (1.0 / o1) / inv_sum
     s2 = total_stake - s1
     profit_each = total_stake / inv_sum - total_stake
@@ -202,8 +200,12 @@ def _safe_float(x: Any) -> Optional[float]:
 
 
 def _start_time_iso_z(client: BetfairClient, market_id: str) -> str:
+    """
+    Fetch start time from Betfair and return ISO8601 Z string (best for JS Date()).
+    Returns "" if unavailable.
+    """
     try:
-        st = client.get_market_start_time(market_id)
+        st = client.get_market_start_time(market_id)  # expected datetime
         if st is None:
             return ""
         if st.tzinfo is None:
@@ -245,6 +247,44 @@ def render_dashboard(message: str = "") -> HTMLResponse:
 
     stake_percent = float(getattr(state, "stake_percent", 5.0) or 5.0)
     total_stake = bank * (stake_percent / 100.0)
+
+    # Live odds rows for selected markets
+    odds_rows: List[Dict[str, Any]] = []
+    if total_stake > 0:
+        for m in markets:
+            mid = m.get("market_id")
+            if not mid or mid not in selected:
+                continue
+            try:
+                favs = client.get_top_two_favourites(mid)
+                if len(favs) < 2:
+                    continue
+
+                o1 = float(favs[0]["back"])
+                o2 = float(favs[1]["back"])
+                calc = _dutch_stakes(total_stake, o1, o2)
+
+                start_raw = _start_time_iso_z(client, mid)
+
+                odds_rows.append(
+                    {
+                        "race": m.get("name", mid),
+                        "market_id": mid,
+                        "start_raw": start_raw,
+                        "fav1": favs[0]["name"],
+                        "fav2": favs[1]["name"],
+                        "odds1": o1,
+                        "odds2": o2,
+                        "s1": calc["stake1"],
+                        "s2": calc["stake2"],
+                        "profit": calc["profit_each"],
+                    }
+                )
+            except Exception as e:
+                print("[WEBAPP] live odds error:", e)
+
+    # ---- FIX for your NameError ----
+    preview_rows = odds_rows
 
     html = f"""
     <html>
@@ -484,13 +524,6 @@ def render_dashboard(message: str = "") -> HTMLResponse:
                 <button class="btn primary" type="submit">Save</button>
                 <button class="btn secondary" name="reset_bank" value="1" type="submit">Reset</button>
               </div>
-
-              <div style="margin-top:10px;">
-                <div class="sub">
-                  Recovery target: <span class="mono">£{getattr(state,'recovery_target',0.0):.2f}</span> |
-                  Stop after win: <span class="mono">{'YES' if getattr(state,'stop_after_win',True) else 'NO'}</span>
-                </div>
-              </div>
             </form>
 
             <hr style="border-color:#1f2937; margin:14px 0;">
@@ -571,8 +604,14 @@ def render_dashboard(message: str = "") -> HTMLResponse:
             </div>
 
             <div style="margin-top:12px;">
-              <div class="sub">
-                Auto-results: <b>ON</b> (the bot will settle each race automatically after the off).
+              <div class="sub">Manual outcome (until auto-result is wired in)</div>
+              <div style="display:flex; flex-wrap:wrap; gap:10px; margin-top:8px;">
+                <form method="post" action="/race_won">
+                  <button class="btn secondary small" type="submit">Race WON</button>
+                </form>
+                <form method="post" action="/race_lost">
+                  <button class="btn secondary small" type="submit">Race LOST</button>
+                </form>
               </div>
             </div>
 
@@ -580,9 +619,12 @@ def render_dashboard(message: str = "") -> HTMLResponse:
 
             <h3 style="margin:0 0 8px 0;">Live odds + projected winnings</h3>
             <div class="sub" style="margin-bottom:8px;">
-              Auto-refreshes every ~7 seconds from <span class="mono">/api/selected_live_odds</span>.
+              Read-only preview using current best available back prices for top 2 favourites.
             </div>
+    """
 
+    if preview_rows:
+        html += """
             <div class="table-wrap">
               <table>
                 <thead>
@@ -598,14 +640,35 @@ def render_dashboard(message: str = "") -> HTMLResponse:
                     <th>Profit if wins</th>
                   </tr>
                 </thead>
-                <tbody id="oddsBody">
+                <tbody>
+        """
+        for r in preview_rows:
+            html += f"""
                   <tr>
-                    <td colspan="9" class="muted">Select one or more races to see live odds + winnings here.</td>
+                    <td style="min-width:220px;">{r['race']}</td>
+                    <td class="mono"><span class="countdown" data-start="{r.get('start_raw','')}">—</span></td>
+                    <td>{r['fav1']}</td>
+                    <td>{r['odds1']:.2f}</td>
+                    <td>£{r['s1']:.2f}</td>
+                    <td>{r['fav2']}</td>
+                    <td>{r['odds2']:.2f}</td>
+                    <td>£{r['s2']:.2f}</td>
+                    <td class="{'green-text' if r['profit'] >= 0 else 'red-text'}">£{r['profit']:.2f}</td>
                   </tr>
+            """
+        html += """
                 </tbody>
               </table>
             </div>
+        """
+    else:
+        html += """
+            <div class="sub muted">
+              Select one or more races to see live odds + winnings here.
+            </div>
+        """
 
+    html += """
             <hr style="border-color:#1f2937; margin:14px 0;">
 
             <h3 style="margin:0 0 8px 0;">History</h3>
@@ -651,7 +714,7 @@ def render_dashboard(message: str = "") -> HTMLResponse:
             <div class="sub muted">No races yet.</div>
         """
 
-    # Logs panel
+    # ---- Logs panel ----
     html += """
             <hr style="border-color:#1f2937; margin:14px 0;">
 
@@ -686,12 +749,13 @@ def render_dashboard(message: str = "") -> HTMLResponse:
           const h = Math.floor(sec / 3600);
           const m = Math.floor((sec % 3600) / 60);
           const s = sec % 60;
+
           if (h > 0) return String(h) + "h " + String(m) + "m " + String(s) + "s";
           if (m > 0) return String(m) + "m " + String(s) + "s";
           return String(s) + "s";
         }
 
-        function tickCountdowns() {
+        function tick() {
           const els = document.querySelectorAll(".countdown");
           const now = new Date();
           els.forEach(el => {
@@ -704,68 +768,6 @@ def render_dashboard(message: str = "") -> HTMLResponse:
           });
         }
 
-        // ---- Odds auto-refresh ----
-        function escapeHtml(s) {
-          return String(s)
-            .replaceAll("&", "&amp;")
-            .replaceAll("<", "&lt;")
-            .replaceAll(">", "&gt;")
-            .replaceAll('"', "&quot;")
-            .replaceAll("'", "&#039;");
-        }
-
-        async function refreshOdds() {
-          try {
-            const r = await fetch("/api/selected_live_odds", { cache: "no-store" });
-            if (!r.ok) return;
-            const j = await r.json();
-            const rows = (j.rows || []);
-            const body = document.getElementById("oddsBody");
-            if (!body) return;
-
-            if (!rows.length) {
-              body.innerHTML = "<tr><td colspan='9' class='muted'>Select one or more races to see live odds + winnings here.</td></tr>";
-              return;
-            }
-
-            let html = "";
-            for (const row of rows) {
-              if (row.error) {
-                html += "<tr><td colspan='9' class='muted'>Error for " + escapeHtml(row.market_id) + ": " + escapeHtml(row.error) + "</td></tr>";
-                continue;
-              }
-
-              const race = row.race || row.market_id;
-              const start_raw = row.start_raw || "";
-              const fav1 = (row.fav1 && row.fav1.name) ? row.fav1.name : (row.fav1_name || "—");
-              const fav2 = (row.fav2 && row.fav2.name) ? row.fav2.name : (row.fav2_name || "—");
-
-              const odds1 = row.odds1;
-              const odds2 = row.odds2;
-              const s1 = row.stake1;
-              const s2 = row.stake2;
-              const profit = row.profit_if_win;
-
-              const profitClass = (typeof profit === "number" && profit >= 0) ? "green-text" : "red-text";
-
-              html += "<tr>"
-                + "<td style='min-width:220px;'>" + escapeHtml(race) + "</td>"
-                + "<td class='mono'><span class='countdown' data-start='" + escapeHtml(start_raw) + "'>—</span></td>"
-                + "<td>" + escapeHtml(fav1) + "</td>"
-                + "<td>" + (typeof odds1 === "number" ? odds1.toFixed(2) : "—") + "</td>"
-                + "<td>£" + (typeof s1 === "number" ? s1.toFixed(2) : "—") + "</td>"
-                + "<td>" + escapeHtml(fav2) + "</td>"
-                + "<td>" + (typeof odds2 === "number" ? odds2.toFixed(2) : "—") + "</td>"
-                + "<td>£" + (typeof s2 === "number" ? s2.toFixed(2) : "—") + "</td>"
-                + "<td class='" + profitClass + "'>£" + (typeof profit === "number" ? profit.toFixed(2) : "—") + "</td>"
-                + "</tr>";
-            }
-
-            body.innerHTML = html;
-            tickCountdowns(); // update countdowns for newly inserted rows
-          } catch (e) {}
-        }
-
         // ---- UI logs ----
         async function fetchLogs(forceScroll=false) {
           try {
@@ -776,8 +778,12 @@ def render_dashboard(message: str = "") -> HTMLResponse:
             if (!el) return;
 
             const nearBottom = (el.scrollTop + el.clientHeight) >= (el.scrollHeight - 40);
+
             el.textContent = (j.lines || []).join("\\n");
-            if (forceScroll || nearBottom) el.scrollTop = el.scrollHeight;
+
+            if (forceScroll || nearBottom) {
+              el.scrollTop = el.scrollHeight;
+            }
           } catch (e) {}
         }
 
@@ -786,11 +792,8 @@ def render_dashboard(message: str = "") -> HTMLResponse:
           if (el) el.textContent = "";
         }
 
-        tickCountdowns();
-        setInterval(tickCountdowns, 1000);
-
-        refreshOdds();
-        setInterval(refreshOdds, 7000);
+        tick();
+        setInterval(tick, 1000);
 
         fetchLogs(true);
         setInterval(fetchLogs, 2000);
@@ -810,7 +813,11 @@ async def login_get(request: Request):
 
 
 @app.post("/login")
-async def login_post(request: Request, username: str = Form(...), password: str = Form(...)):
+async def login_post(
+    request: Request,
+    username: str = Form(...),
+    password: str = Form(...),
+):
     if username == ADMIN_USERNAME and password == ADMIN_PASSWORD:
         request.session["user"] = "admin"
         return RedirectResponse("/", status_code=303)
@@ -915,6 +922,30 @@ async def stop_bot(request: Request):
     return render_dashboard("Bot stopped.")
 
 
+@app.post("/race_won")
+async def race_won(request: Request):
+    redirect = require_login(request)
+    if redirect:
+        return redirect
+
+    get_client()
+    assert runner is not None
+    runner.mark_race_won()
+    return render_dashboard("Race marked as WON.")
+
+
+@app.post("/race_lost")
+async def race_lost(request: Request):
+    redirect = require_login(request)
+    if redirect:
+        return redirect
+
+    get_client()
+    assert runner is not None
+    runner.mark_race_lost()
+    return render_dashboard("Race marked as LOST.")
+
+
 @app.get("/inspect_hurdles")
 async def inspect_hurdles(request: Request):
     redirect = require_login(request)
@@ -954,31 +985,24 @@ async def api_selected_live_odds(request: Request):
         return JSONResponse({"detail": "Unauthorized"}, status_code=401)
 
     client = get_client()
-
     bank = float(getattr(state, "bank", 100.0) or 100.0)
     stake_percent = float(getattr(state, "stake_percent", 5.0) or 5.0)
     total_stake = bank * (stake_percent / 100.0)
 
-    rows = []
+    out = []
     for mid in getattr(state, "selected_markets", []) or []:
         try:
             favs = client.get_top_two_favourites(mid)
             if len(favs) < 2:
                 continue
-
             o1 = float(favs[0]["back"])
             o2 = float(favs[1]["back"])
             calc = _dutch_stakes(total_stake, o1, o2)
-
-            rows.append(
+            out.append(
                 {
                     "market_id": mid,
-                    "race": client.get_market_name(mid),
-                    "start_raw": _start_time_iso_z(client, mid),
-                    "fav1": {"name": favs[0].get("name", "—"), "selection_id": favs[0].get("selection_id")},
-                    "fav2": {"name": favs[1].get("name", "—"), "selection_id": favs[1].get("selection_id")},
-                    "odds1": o1,
-                    "odds2": o2,
+                    "fav1": favs[0],
+                    "fav2": favs[1],
                     "total_stake": total_stake,
                     "stake1": calc["stake1"],
                     "stake2": calc["stake2"],
@@ -986,9 +1010,9 @@ async def api_selected_live_odds(request: Request):
                 }
             )
         except Exception as e:
-            rows.append({"market_id": mid, "error": str(e)})
+            out.append({"market_id": mid, "error": str(e)})
 
-    return JSONResponse({"rows": rows})
+    return JSONResponse({"rows": out})
 
 
 @app.get("/api/logs")
@@ -1005,4 +1029,6 @@ async def api_logs(request: Request, n: int = 250):
 
     lines = list(LOG_BUFFER)[-n:]
     return JSONResponse({"lines": lines})
+
+
 

@@ -1,0 +1,330 @@
+# betfair_client.py
+#
+# BetfairClient:
+#   - identitysso login (dev key)
+#   - JSON-RPC betting + account endpoints
+#   - listMarketCatalogue (markets list)
+#   - listMarketBook (prices)
+#   - getAccountFunds (balance)
+#   - get_todays_novice_hurdle_markets(): UK/IE novice hurdle-ish WIN markets (no fallback)
+#   - helpers used by webapp:
+#       get_market_name()
+#       get_market_start_time()
+#       get_top_two_favourites()
+
+import os
+import datetime as dt
+from typing import List, Dict, Any, Optional
+
+import requests
+
+BETTING_ENDPOINT = "https://api.betfair.com/exchange/betting/json-rpc/v1"
+ACCOUNT_ENDPOINT = "https://api.betfair.com/exchange/account/json-rpc/v1"
+IDENTITY_ENDPOINT = "https://identitysso.betfair.com/api/login"
+
+
+class BetfairClient:
+    VERSION = "2025-12-13-UKIE-NOV-HURDLE-WEBAPP"
+
+    def __init__(self, use_dummy: bool = True):
+        self.use_dummy = use_dummy
+
+        self.app_key = os.getenv("BETFAIR_APP_KEY", "")
+        self.username = os.getenv("BETFAIR_USERNAME", "")
+        self.password = os.getenv("BETFAIR_PASSWORD", "")
+
+        self.session_token: Optional[str] = None
+
+        print(f"[BETFAIR] Client version: {self.VERSION}")
+        print(f"[BETFAIR] Initialising client. use_dummy={self.use_dummy}")
+
+        if not self.use_dummy:
+            print(
+                f"[BETFAIR] APP_KEY set: {bool(self.app_key)} | "
+                f"USERNAME set: {bool(self.username)}"
+            )
+            self._login()
+
+    # -------------------------
+    # Auth
+    # -------------------------
+
+    def _login(self):
+        if not (self.app_key and self.username and self.password):
+            raise RuntimeError(
+                "BETFAIR_APP_KEY / BETFAIR_USERNAME / BETFAIR_PASSWORD env vars not set"
+            )
+
+        headers = {
+            "X-Application": self.app_key,
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json",
+        }
+        data = {"username": self.username, "password": self.password}
+
+        print("[BETFAIR] Logging in via identitysso...")
+        resp = requests.post(IDENTITY_ENDPOINT, headers=headers, data=data, timeout=15)
+        print(f"[BETFAIR] Login HTTP status: {resp.status_code}")
+
+        try:
+            js = resp.json()
+            print("[BETFAIR] Raw JSON login response:", js)
+        except Exception:
+            print("[BETFAIR] Login response was not JSON. Raw body (trimmed):")
+            print(resp.text[:500])
+            raise RuntimeError("Betfair login did not return JSON")
+
+        if js.get("status") != "SUCCESS":
+            raise RuntimeError(f"Betfair login failed: {js}")
+
+        self.session_token = js["token"]
+        print("[BETFAIR] Logged in, session token acquired.")
+
+    def _headers(self) -> Dict[str, str]:
+        if self.use_dummy:
+            return {}
+        if not self.session_token:
+            self._login()
+        return {
+            "X-Application": self.app_key,
+            "X-Authentication": self.session_token,
+            "Content-Type": "application/json",
+        }
+
+    def _rpc(self, method: str, params: Dict[str, Any]) -> Any:
+        payload = {
+            "jsonrpc": "2.0",
+            "method": f"SportsAPING/v1.0/{method}",
+            "params": params,
+            "id": 1,
+        }
+        resp = requests.post(
+            BETTING_ENDPOINT,
+            headers=self._headers(),
+            json=payload,
+            timeout=20,
+        )
+        print(f"[BETFAIR] RPC {method} HTTP status: {resp.status_code}")
+        resp.raise_for_status()
+        js = resp.json()
+        if "error" in js:
+            raise RuntimeError(f"Betfair API error: {js['error']}")
+        return js["result"]
+
+    def _account_rpc(self, method: str, params: Dict[str, Any]) -> Any:
+        payload = {
+            "jsonrpc": "2.0",
+            "method": f"AccountAPING/v1.0/{method}",
+            "params": params,
+            "id": 1,
+        }
+        resp = requests.post(
+            ACCOUNT_ENDPOINT,
+            headers=self._headers(),
+            json=payload,
+            timeout=20,
+        )
+        print(f"[BETFAIR] ACCOUNT RPC {method} HTTP status: {resp.status_code}")
+        resp.raise_for_status()
+        js = resp.json()
+        if "error" in js:
+            raise RuntimeError(f"Betfair Account API error: {js['error']}")
+        return js["result"]
+
+    # -------------------------
+    # Account funds
+    # -------------------------
+
+    def get_account_funds(self) -> Dict[str, Optional[float]]:
+        if self.use_dummy:
+            print("[BETFAIR] Returning DUMMY account funds.")
+            return {
+                "available_to_bet": 1000.0,
+                "exposure": 0.0,
+                "retained_commission": 0.0,
+                "exposure_limit": None,
+                "discount_rate": None,
+                "points_balance": None,
+            }
+
+        print("[BETFAIR] Fetching REAL account funds.")
+        result = self._account_rpc("getAccountFunds", {})
+        funds = {
+            "available_to_bet": result.get("availableToBetBalance"),
+            "exposure": result.get("exposure"),
+            "retained_commission": result.get("retainedCommission"),
+            "exposure_limit": result.get("exposureLimit"),
+            "discount_rate": result.get("discountRate"),
+            "points_balance": result.get("pointsBalance"),
+        }
+        print("[BETFAIR] Account funds:", funds)
+        return funds
+
+    # -------------------------
+    # Markets (UK/IE novice hurdle-ish WIN markets)
+    # -------------------------
+
+    def get_todays_novice_hurdle_markets(self) -> List[Dict[str, Any]]:
+        """
+        Returns ONLY UK & Ireland novice hurdle-ish WIN markets from now → +36h.
+
+        Filter:
+          - eventTypeIds: 7 (Horse Racing)
+          - marketCountries: GB, IE
+          - marketTypeCodes: WIN
+          - market name must contain:
+              ("nov" or "novice") AND ("hrd" or "hurd" or "hdl" or "hurdle")
+        No fallback: returns [] if none.
+        """
+        if self.use_dummy:
+            print("[BETFAIR] Returning DUMMY novice hurdle markets.")
+            now = dt.datetime.now(dt.timezone.utc)
+            return [
+                {"market_id": "1.234567891", "name": f"Doncaster | 2m3f Nov Hrd | {now.isoformat()}"},
+                {"market_id": "1.234567892", "name": f"Lingfield | 2m Nov Hrd | {now.isoformat()}"},
+            ]
+
+        now = dt.datetime.now(dt.timezone.utc)
+        to = now + dt.timedelta(hours=36)
+
+        params = {
+            "filter": {
+                "eventTypeIds": ["7"],
+                "marketTypeCodes": ["WIN"],
+                "marketCountries": ["GB", "IE"],
+                "marketStartTime": {
+                    "from": now.isoformat().replace("+00:00", "Z"),
+                    "to": to.isoformat().replace("+00:00", "Z"),
+                },
+            },
+            "maxResults": 200,
+            "marketProjection": ["MARKET_START_TIME", "EVENT"],
+        }
+
+        print("[BETFAIR] Fetching REAL UK/IE WIN markets (+36h) and filtering novice hurdles...")
+        result = self._rpc("listMarketCatalogue", params)
+        out: List[Dict[str, Any]] = []
+
+        for m in result:
+            name = (m.get("marketName") or "").strip()
+            event = m.get("event") or {}
+            venue = (event.get("venue") or "").strip()
+            start = m.get("marketStartTime") or ""
+
+            low = name.lower()
+            is_nov = ("novice" in low) or (" nov" in low) or low.startswith("nov") or (" nov " in low) or (" nov." in low) or (" nov" in low)
+            is_hurd = ("hrd" in low) or ("hurd" in low) or ("hdl" in low) or ("hurdle" in low)
+
+            if not (is_nov and is_hurd):
+                continue
+
+            nice = f"{venue} | {name} | {start} ({m.get('marketId')})".strip()
+            out.append({"market_id": m["marketId"], "name": nice})
+
+        print(f"[BETFAIR] UK/IE novice hurdle-ish WIN markets found: {len(out)}")
+        return out
+
+    # -------------------------
+    # Helpers used by webapp
+    # -------------------------
+
+    def get_market_name(self, market_id: str) -> str:
+        if self.use_dummy:
+            return f"Dummy market {market_id}"
+
+        params = {
+            "filter": {"marketIds": [market_id]},
+            "maxResults": 1,
+            "marketProjection": ["EVENT"],
+        }
+        res = self._rpc("listMarketCatalogue", params)
+        if not res:
+            return market_id
+        m = res[0]
+        ev = m.get("event") or {}
+        venue = ev.get("venue") or ev.get("name") or ""
+        return f"{venue} | {m.get('marketName', market_id)}"
+
+    def get_market_start_time(self, market_id: str) -> dt.datetime:
+        if self.use_dummy:
+            return dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=10)
+
+        params = {
+            "filter": {"marketIds": [market_id]},
+            "maxResults": 1,
+            "marketProjection": ["MARKET_START_TIME"],
+        }
+        res = self._rpc("listMarketCatalogue", params)
+        if not res:
+            raise RuntimeError(f"No marketStartTime for {market_id}")
+        raw = res[0].get("marketStartTime")
+        if not raw:
+            raise RuntimeError(f"Missing marketStartTime for {market_id}")
+
+        if raw.endswith("Z"):
+            raw = raw.replace("Z", "+00:00")
+        d = dt.datetime.fromisoformat(raw)
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=dt.timezone.utc)
+        else:
+            d = d.astimezone(dt.timezone.utc)
+        return d
+
+    def get_top_two_favourites(self, market_id: str) -> List[Dict[str, Any]]:
+        """
+        Returns top 2 favourites by lowest BACK price:
+          [{selection_id, name, back, lay}, ...]
+        """
+        if self.use_dummy:
+            return [
+                {"selection_id": 1, "name": "Dummy Fav 1", "back": 2.2, "lay": 2.28},
+                {"selection_id": 2, "name": "Dummy Fav 2", "back": 3.1, "lay": 3.2},
+            ]
+
+        # runner names
+        cat_params = {
+            "filter": {"marketIds": [market_id]},
+            "maxResults": 1,
+            "marketProjection": ["RUNNER_DESCRIPTION"],
+        }
+        cat = self._rpc("listMarketCatalogue", cat_params)
+        name_map: Dict[int, str] = {}
+        if cat:
+            for r in cat[0].get("runners", []):
+                name_map[r["selectionId"]] = r.get("runnerName", str(r["selectionId"]))
+
+        # prices
+        book_params = {
+            "marketIds": [market_id],
+            "priceProjection": {
+                "priceData": ["EX_BEST_OFFERS"],
+                "virtualise": True,
+            },
+        }
+        books = self._rpc("listMarketBook", book_params)
+        if not books:
+            return []
+
+        runners = books[0].get("runners", [])
+        priced: List[Dict[str, Any]] = []
+
+        for r in runners:
+            sel = r.get("selectionId")
+            ex = r.get("ex") or {}
+            backs = ex.get("availableToBack") or []
+            lays = ex.get("availableToLay") or []
+            if not backs or not lays:
+                continue
+            back = float(backs[0]["price"])
+            lay = float(lays[0]["price"])
+            priced.append(
+                {
+                    "selection_id": sel,
+                    "name": name_map.get(sel, str(sel)),
+                    "back": back,
+                    "lay": lay,
+                }
+            )
+
+        priced.sort(key=lambda x: x["back"])
+        return priced[:2]
