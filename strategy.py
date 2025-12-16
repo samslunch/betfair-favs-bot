@@ -1,39 +1,334 @@
 # strategy.py
 #
-# StrategyState + BotRunner for 2-fav dutching bot.
+# Strategy + runner:
+# - Scheduler tick every 30s (configurable)
+# - De-dup: cannot act twice on same market_id
+# - Min/Max odds enforced
+# - Option B loss recovery: recoup losses until first win, then STOP
+# - Auto results ON: polls Betfair for winner after market closes
+# - Works with dummy/simulation/live (live placing is still guarded in betfair_client.py)
 #
-# Now includes:
-#   - Option B loss recovery (recoup losses until a win, then STOP)
-#   - Auto-result settlement (no manual won/lost buttons required)
-#   - Read-only mode by default (NO placeOrders) – logs "READY" only
-#
-# Requirements:
-#   betfair_client.BetfairClient must provide:
-#     - get_market_start_time(market_id) -> datetime
-#     - get_market_name(market_id) -> str
-#     - get_top_two_favourites(market_id) -> list of dicts containing:
-#         {"name": str, "back": float, "selection_id": int}  (selection_id strongly recommended)
-#     - get_market_result(market_id) -> dict like:
-#         {"status": "OPEN"/"SUSPENDED"/"CLOSED", "winner_selection_id": int|None, "runner_status": {selId: "WINNER"/...}}
-#
-# Dummy mode:
-#   - We simulate a result shortly after "READY" if BetfairClient.use_dummy is True.
-
-from __future__ import annotations
-
 import asyncio
 import datetime as dt
 from dataclasses import dataclass, field
-from typing import Optional, Any, Dict, List
+from typing import Any, Dict, List, Optional, Set
+
+from betfair_client import BetfairClient
 
 
 @dataclass
 class StrategyState:
-    # Bank settings
-    starting_bank: float = 100.0
+    # bank
     bank: float = 100.0
-    stake_percent: float = 5.0
+    starting_bank: float = 100.0
 
+    # staking / filters
+    stake_percent: float = 5.0
+    seconds_before_off: int = 60
+    min_odds: float = 1.01
+    max_odds: float = 1000.0
+
+    # scheduling
+    tick_seconds: int = 30
+
+    # selection
+    selected_markets: List[str] = field(default_factory=list)
+    current_index: int = 0
+    current_market_id: Optional[str] = None
+
+    # runner status
+    running: bool = False
+
+    # option B: loss recovery
+    loss_carry: float = 0.0  # cumulative losses to recoup
+    stop_after_first_win: bool = True
+
+    # last action snapshot
+    last_total_stake: float = 0.0
+    last_favourites: Optional[List[Dict[str, Any]]] = None
+    last_profit_if_win: float = 0.0
+
+    # dedup
+    acted_market_ids: Set[str] = field(default_factory=set)
+
+    # history
+    history: List[Dict[str, Any]] = field(default_factory=list)
+
+
+class BotRunner:
+    def __init__(self, client: BetfairClient, state: StrategyState):
+        self.client = client
+        self.state = state
+        self._task: Optional[asyncio.Task] = None
+
+    def start(self) -> None:
+        if self.state.running:
+            print("[BOT] Already running.")
+            return
+        if not self.state.selected_markets:
+            print("[BOT] Cannot start: no markets selected.")
+            return
+
+        self.state.running = True
+        if self.state.current_index >= len(self.state.selected_markets):
+            self.state.current_index = 0
+
+        loop = asyncio.get_event_loop()
+        self._task = loop.create_task(self._run_loop())
+        print(f"[BOT] Loop started. tick={self.state.tick_seconds}s")
+
+    def stop(self) -> None:
+        self.state.running = False
+        if self._task and not self._task.done():
+            self._task.cancel()
+        print("[BOT] Stop requested")
+
+    # -------------------------
+    # Core logic
+    # -------------------------
+
+    def _base_stake(self) -> float:
+        return max(0.0, self.state.bank * (self.state.stake_percent / 100.0))
+
+    def _dutch_calc(self, total_stake: float, o1: float, o2: float) -> Dict[str, float]:
+        inv_sum = (1.0 / o1) + (1.0 / o2)
+        s1 = total_stake * (1.0 / o1) / inv_sum
+        s2 = total_stake - s1
+        profit_each = total_stake / inv_sum - total_stake
+        return {"stake1": s1, "stake2": s2, "profit_each": profit_each}
+
+    def _required_stake_for_profit(self, target_profit: float, o1: float, o2: float) -> Optional[float]:
+        """
+        profit_each = total_stake*(1/inv_sum - 1)
+        total_stake = target_profit / (1/inv_sum - 1)
+        """
+        inv_sum = (1.0 / o1) + (1.0 / o2)
+        denom = (1.0 / inv_sum) - 1.0
+        if denom <= 0:
+            return None
+        return target_profit / denom
+
+    async def _run_loop(self) -> None:
+        try:
+            while self.state.running:
+                if self.state.current_index >= len(self.state.selected_markets):
+                    print("[BOT] No more selected markets. Stopping.")
+                    self.state.running = False
+                    break
+
+                market_id = self.state.selected_markets[self.state.current_index]
+                self.state.current_market_id = market_id
+
+                # de-dup: if we already acted on this market, skip forward
+                if market_id in self.state.acted_market_ids:
+                    print(f"[BOT] De-dup skip (already acted): {market_id}")
+                    self._advance_market()
+                    await asyncio.sleep(0.1)
+                    continue
+
+                # fetch start time
+                try:
+                    start_time = self.client.get_market_start_time(market_id)
+                    market_name = self.client.get_market_name(market_id)
+                except Exception as e:
+                    print("[BOT] Error fetching market info:", e)
+                    self._advance_market()
+                    await asyncio.sleep(0.1)
+                    continue
+
+                if not start_time:
+                    print("[BOT] No start time, skipping:", market_id)
+                    self._advance_market()
+                    await asyncio.sleep(0.1)
+                    continue
+
+                now = dt.datetime.now(dt.timezone.utc)
+                if start_time.tzinfo is None:
+                    start_time = start_time.replace(tzinfo=dt.timezone.utc)
+                else:
+                    start_time = start_time.astimezone(dt.timezone.utc)
+
+                seconds_to_off = (start_time - now).total_seconds()
+                seconds_to_action = seconds_to_off - float(self.state.seconds_before_off)
+
+                # not time yet -> tick scheduler
+                if seconds_to_action > 0:
+                    sleep_for = min(float(self.state.tick_seconds), seconds_to_action)
+                    print(f"[BOT] Tick sleep {sleep_for:.0f}s | {market_name} ({market_id}) off in {seconds_to_off:.0f}s")
+                    try:
+                        await asyncio.sleep(sleep_for)
+                    except asyncio.CancelledError:
+                        print("[BOT] Cancelled while waiting.")
+                        return
+                    continue
+
+                # TIME TO ACT (once)
+                self.state.acted_market_ids.add(market_id)
+
+                # get favourites
+                try:
+                    favs = self.client.get_top_two_favourites(market_id)
+                except Exception as e:
+                    print("[BOT] Error getting favourites:", e)
+                    self._advance_market()
+                    continue
+
+                if len(favs) < 2:
+                    print("[BOT] <2 favourites with usable back prices, skipping.")
+                    self._advance_market()
+                    continue
+
+                # odds filter
+                f1, f2 = favs[0], favs[1]
+                o1, o2 = float(f1["back"]), float(f2["back"])
+                if not (self.state.min_odds <= o1 <= self.state.max_odds and self.state.min_odds <= o2 <= self.state.max_odds):
+                    print(f"[BOT] Odds out of range, skipping. o1={o1} o2={o2} range=[{self.state.min_odds},{self.state.max_odds}]")
+                    self._advance_market()
+                    continue
+
+                # Option B: recoup losses until win then STOP
+                base_stake = self._base_stake()
+                total_stake = base_stake
+
+                if self.state.loss_carry > 0:
+                    req = self._required_stake_for_profit(self.state.loss_carry, o1, o2)
+                    if req is None:
+                        print("[BOT] Cannot compute recovery stake (bad denom). Skipping.")
+                        self._advance_market()
+                        continue
+                    total_stake = max(base_stake, req)
+
+                if total_stake <= 0:
+                    print("[BOT] total_stake<=0, stopping.")
+                    self.state.running = False
+                    break
+
+                calc = self._dutch_calc(total_stake, o1, o2)
+                self.state.last_total_stake = total_stake
+                self.state.last_favourites = favs
+                self.state.last_profit_if_win = calc["profit_each"]
+
+                stake1 = calc["stake1"]
+                stake2 = calc["stake2"]
+
+                print(
+                    f"[BOT] ACT: {market_name} ({market_id})\n"
+                    f"      total_stake £{total_stake:.2f} | loss_carry £{self.state.loss_carry:.2f}\n"
+                    f"      £{stake1:.2f} on {f1['name']} @ {o1}\n"
+                    f"      £{stake2:.2f} on {f2['name']} @ {o2}\n"
+                    f"      profit_if_win ≈ £{calc['profit_each']:.2f}\n"
+                )
+
+                # Place (guarded in client): simulation will NEVER place.
+                try:
+                    self.client.place_dutch_bets(market_id, [
+                        {"selectionId": int(f1["selection_id"]), "side": "BACK", "size": stake1, "price": o1},
+                        {"selectionId": int(f2["selection_id"]), "side": "BACK", "size": stake2, "price": o2},
+                    ])
+                except Exception as e:
+                    print("[BOT] place_dutch_bets error:", e)
+
+                # Auto result: poll until closed/winner
+                await self._wait_for_result_and_record(
+                    market_id=market_id,
+                    market_name=market_name,
+                    fav1=f1, fav2=f2,
+                    o1=o1, o2=o2,
+                    stake1=stake1, stake2=stake2,
+                    total_stake=total_stake,
+                    profit_if_win=calc["profit_each"],
+                )
+
+                # move on
+                if self.state.running:
+                    self._advance_market()
+
+        except asyncio.CancelledError:
+            print("[BOT] Cancelled.")
+            return
+        finally:
+            print("[BOT] Loop finished.")
+
+    async def _wait_for_result_and_record(
+        self,
+        market_id: str,
+        market_name: str,
+        fav1: Dict[str, Any],
+        fav2: Dict[str, Any],
+        o1: float, o2: float,
+        stake1: float, stake2: float,
+        total_stake: float,
+        profit_if_win: float,
+    ) -> None:
+        print(f"[BOT] Waiting for result: {market_name} ({market_id})")
+        while self.state.running:
+            try:
+                res = self.client.get_market_result(market_id)
+                if res.get("is_closed") or res.get("winner_selection_id"):
+                    winner = res.get("winner_selection_id")
+                    self._record_auto_result(
+                        market_name=market_name,
+                        market_id=market_id,
+                        fav1=fav1, fav2=fav2,
+                        winner_selection_id=winner,
+                        total_stake=total_stake,
+                        profit_if_win=profit_if_win,
+                    )
+                    return
+            except Exception as e:
+                print("[BOT] result poll error:", e)
+
+            # poll interval = tick_seconds (default 30)
+            try:
+                await asyncio.sleep(float(self.state.tick_seconds))
+            except asyncio.CancelledError:
+                return
+
+    def _record_auto_result(
+        self,
+        market_name: str,
+        market_id: str,
+        fav1: Dict[str, Any],
+        fav2: Dict[str, Any],
+        winner_selection_id: Optional[int],
+        total_stake: float,
+        profit_if_win: float,
+    ) -> None:
+        won = winner_selection_id in (int(fav1["selection_id"]), int(fav2["selection_id"]))
+
+        if won:
+            pl = float(profit_if_win)
+            self.state.bank += pl
+            self.state.loss_carry = 0.0
+        else:
+            pl = -float(total_stake)
+            self.state.bank += pl
+            self.state.loss_carry += float(total_stake)
+
+        self.state.history.append({
+            "ts": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "race_name": market_name,
+            "market_id": market_id,
+            "favs": f"{fav1['name']} / {fav2['name']}",
+            "total_stake": float(total_stake),
+            "pl": float(pl),
+            "won": bool(won),
+            "winner_selection_id": winner_selection_id,
+        })
+
+        print(f"[BOT] RESULT: {market_name} -> {'WIN' if won else 'LOSS'} | P/L £{pl:.2f} | bank £{self.state.bank:.2f} | loss_carry £{self.state.loss_carry:.2f}")
+
+        # Option B: stop after first win
+        if won and self.state.stop_after_first_win:
+            print("[BOT] STOP AFTER WIN enabled. Stopping bot.")
+            self.state.running = False
+
+    def _advance_market(self) -> None:
+        self.state.current_index += 1
+        self.state.current_market_id = None
+        self.state.last_favourites = None
+        self.state.last_total_stake = 0.0
+        self.state.last_profit_if_win = 0.0
     # Selection / sequencing
     selected_markets: List[str] = field(default_factory=list)
     current_index: int = 0
